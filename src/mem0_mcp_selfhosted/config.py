@@ -83,6 +83,9 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         vector_config["api_key"] = qdrant_api_key
     if qdrant_on_disk:
         vector_config["on_disk"] = True
+    qdrant_timeout = os.environ.get("MEM0_QDRANT_TIMEOUT")
+    if qdrant_timeout:
+        vector_config["timeout"] = int(qdrant_timeout)
 
     # --- History ---
     history_db_path = os.environ.get("MEM0_HISTORY_DB_PATH")

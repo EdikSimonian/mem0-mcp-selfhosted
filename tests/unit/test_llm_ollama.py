@@ -1,4 +1,4 @@
-"""Tests for llm_ollama.py — OllamaToolLLM tool-calling support."""
+"""Tests for llm_ollama.py — OllamaToolLLM with defense-in-depth layers."""
 
 from __future__ import annotations
 
@@ -8,7 +8,11 @@ import pytest
 
 from mem0.llms.ollama import OllamaLLM
 
-from mem0_mcp_selfhosted.llm_ollama import OllamaToolLLM
+from mem0_mcp_selfhosted.llm_ollama import (
+    OllamaToolLLM,
+    _strip_think_tags,
+    extract_json,
+)
 
 
 @pytest.fixture
@@ -58,6 +62,77 @@ class TestSubclass:
     def test_isinstance_check(self, ollama_llm):
         """Instance passes isinstance check for OllamaLLM."""
         assert isinstance(ollama_llm, OllamaLLM)
+
+
+class TestExtractJson:
+    def test_code_fenced_json(self):
+        """Code-fenced JSON is extracted."""
+        text = '```json\n{"facts": ["a"]}\n```'
+        assert extract_json(text) == '{"facts": ["a"]}'
+
+    def test_code_fenced_without_lang(self):
+        """Code fence without 'json' label is extracted."""
+        text = '```\n{"facts": ["a"]}\n```'
+        assert extract_json(text) == '{"facts": ["a"]}'
+
+    def test_text_prefixed_json(self):
+        """Text-prefixed JSON is extracted."""
+        text = 'Here is the JSON: {"facts": ["a"]}'
+        assert extract_json(text) == '{"facts": ["a"]}'
+
+    def test_clean_json_passthrough(self):
+        """Clean JSON passes through unchanged."""
+        text = '{"facts": ["a"]}'
+        assert extract_json(text) == '{"facts": ["a"]}'
+
+    def test_empty_string_passthrough(self):
+        """Empty string passes through unchanged."""
+        assert extract_json("") == ""
+
+    def test_whitespace_only_passthrough(self):
+        """Whitespace-only string passes through."""
+        assert extract_json("   ") == ""
+
+    def test_array_extraction(self):
+        """Text-prefixed array JSON is extracted."""
+        text = 'Result: [{"name": "Alice"}]'
+        assert extract_json(text) == '[{"name": "Alice"}]'
+
+    def test_unclosed_code_fence(self):
+        """Unclosed code fence content is extracted."""
+        text = '```json\n{"facts": ["a"]}'
+        assert extract_json(text) == '{"facts": ["a"]}'
+
+
+class TestStripThinkTags:
+    def test_closed_think_tags_removed(self):
+        """Closed <think>...</think> blocks are removed."""
+        text = '<think>reasoning here</think>{"facts": ["a"]}'
+        assert _strip_think_tags(text) == '{"facts": ["a"]}'
+
+    def test_unclosed_think_tag_removed(self):
+        """Unclosed <think> removes everything from tag to end."""
+        text = '<think>partial reasoning'
+        assert _strip_think_tags(text) == ""
+
+    def test_content_without_think_tags_unchanged(self):
+        """Content without think tags passes through unchanged."""
+        text = '{"facts": ["a"]}'
+        assert _strip_think_tags(text) == '{"facts": ["a"]}'
+
+    def test_think_tags_with_surrounding_content(self):
+        """Think tags embedded in content are removed, surrounding preserved."""
+        text = 'prefix <think>reasoning</think> suffix'
+        assert _strip_think_tags(text) == 'prefix  suffix'
+
+    def test_multiple_think_blocks(self):
+        """Multiple think blocks are all removed."""
+        text = '<think>first</think>middle<think>second</think>end'
+        assert _strip_think_tags(text) == 'middleend'
+
+    def test_empty_string(self):
+        """Empty string passes through."""
+        assert _strip_think_tags("") == ""
 
 
 class TestGenerateResponse:
@@ -140,7 +215,7 @@ class TestGenerateResponse:
         assert messages[0]["content"] == original_content
 
     def test_options_include_config_values(self, ollama_llm):
-        """Options dict includes temperature, num_predict, top_p from config."""
+        """Plain text requests use configured temperature from config."""
         mock_response = MagicMock()
         mock_response.message.content = "test"
         mock_response.message.tool_calls = None
@@ -232,3 +307,354 @@ class TestParseResponse:
         result = ollama_llm._parse_response(response, tools=None)
 
         assert result == "Plain text response"
+
+    def test_think_tags_stripped_from_tool_response(self, ollama_llm):
+        """Think tags are stripped from content in tool responses."""
+        response = MagicMock()
+        response.message.content = "<think>reasoning</think>cleaned content"
+        response.message.tool_calls = None
+
+        result = ollama_llm._parse_response(response, tools=SAMPLE_TOOLS)
+
+        assert result["content"] == "cleaned content"
+
+    def test_think_tags_stripped_from_non_tool_response(self, ollama_llm):
+        """Think tags are stripped from content in non-tool responses."""
+        response = MagicMock()
+        response.message.content = "<think>reasoning</think>clean text"
+
+        result = ollama_llm._parse_response(response, tools=None)
+
+        assert result == "clean text"
+
+
+class TestNoThinkInjection:
+    def test_no_think_injected_for_json_request(self, ollama_llm):
+        """/no_think is appended to last user message for JSON requests."""
+        mock_response = MagicMock()
+        mock_response.message.content = '{"facts": ["a"]}'
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        with patch.dict("os.environ", {}, clear=False):
+            # Ensure MEM0_OLLAMA_THINK is not set
+            import os
+            os.environ.pop("MEM0_OLLAMA_THINK", None)
+
+            ollama_llm.generate_response(
+                messages=[{"role": "user", "content": "extract facts"}],
+                response_format={"type": "json_object"},
+            )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        last_user = [m for m in params["messages"] if m["role"] == "user"][-1]
+        assert "/no_think" in last_user["content"]
+
+    def test_no_think_injected_for_tool_request(self, ollama_llm):
+        """/no_think is appended for tool-calling requests."""
+        mock_response = MagicMock()
+        mock_response.message.content = ""
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("MEM0_OLLAMA_THINK", None)
+
+            ollama_llm.generate_response(
+                messages=[{"role": "user", "content": "extract entities"}],
+                tools=SAMPLE_TOOLS,
+            )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        last_user = [m for m in params["messages"] if m["role"] == "user"][-1]
+        assert "/no_think" in last_user["content"]
+
+    def test_no_think_not_duplicated(self, ollama_llm):
+        """/no_think is not added if already present."""
+        mock_response = MagicMock()
+        mock_response.message.content = '{"facts": []}'
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("MEM0_OLLAMA_THINK", None)
+
+            ollama_llm.generate_response(
+                messages=[{"role": "user", "content": "extract facts /no_think"}],
+                response_format={"type": "json_object"},
+            )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        last_user = [m for m in params["messages"] if m["role"] == "user"][-1]
+        # Should contain exactly one /no_think, not two
+        assert last_user["content"].count("/no_think") == 1
+
+    def test_no_think_not_injected_when_think_present(self, ollama_llm):
+        """/no_think is NOT injected when /think is already present."""
+        mock_response = MagicMock()
+        mock_response.message.content = '{"facts": []}'
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("MEM0_OLLAMA_THINK", None)
+
+            ollama_llm.generate_response(
+                messages=[{"role": "user", "content": "extract facts /think"}],
+                response_format={"type": "json_object"},
+            )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        last_user = [m for m in params["messages"] if m["role"] == "user"][-1]
+        assert "/no_think" not in last_user["content"]
+
+    def test_no_think_disabled_by_env_var(self, ollama_llm):
+        """/no_think is NOT injected when MEM0_OLLAMA_THINK=true."""
+        mock_response = MagicMock()
+        mock_response.message.content = '{"facts": []}'
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        with patch.dict("os.environ", {"MEM0_OLLAMA_THINK": "true"}, clear=False):
+            ollama_llm.generate_response(
+                messages=[{"role": "user", "content": "extract facts"}],
+                response_format={"type": "json_object"},
+            )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        last_user = [m for m in params["messages"] if m["role"] == "user"][-1]
+        assert "/no_think" not in last_user["content"]
+
+    def test_caller_messages_not_mutated(self, ollama_llm):
+        """Original caller messages are NOT mutated by /no_think injection."""
+        mock_response = MagicMock()
+        mock_response.message.content = '{"facts": []}'
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        original_content = "extract facts"
+        messages = [{"role": "user", "content": original_content}]
+
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("MEM0_OLLAMA_THINK", None)
+
+            ollama_llm.generate_response(
+                messages=messages,
+                response_format={"type": "json_object"},
+            )
+
+        # Original message must be unchanged
+        assert messages[0]["content"] == original_content
+
+
+class TestDeterministicOptions:
+    def test_temperature_zero_for_json(self, ollama_llm):
+        """JSON requests override temperature to 0."""
+        mock_response = MagicMock()
+        mock_response.message.content = '{"facts": []}'
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "extract"}],
+            response_format={"type": "json_object"},
+        )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        assert params["options"]["temperature"] == 0
+
+    def test_temperature_zero_for_tools(self, ollama_llm):
+        """Tool requests override temperature to 0."""
+        mock_response = MagicMock()
+        mock_response.message.content = ""
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "extract"}],
+            tools=SAMPLE_TOOLS,
+        )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        assert params["options"]["temperature"] == 0
+
+    def test_repeat_penalty_for_json(self, ollama_llm):
+        """JSON requests set repeat_penalty to 1.0."""
+        mock_response = MagicMock()
+        mock_response.message.content = '{"facts": []}'
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "extract"}],
+            response_format={"type": "json_object"},
+        )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        assert params["options"]["repeat_penalty"] == 1.0
+
+    def test_configured_temperature_for_plain_text(self, ollama_llm):
+        """Plain text requests use configured temperature."""
+        mock_response = MagicMock()
+        mock_response.message.content = "hello"
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        assert params["options"]["temperature"] == 0.7
+        assert "repeat_penalty" not in params["options"]
+
+
+class TestKeepAlive:
+    def test_default_keep_alive(self, ollama_llm):
+        """Default keep_alive is '30m' when env var not set."""
+        mock_response = MagicMock()
+        mock_response.message.content = "test"
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("MEM0_OLLAMA_KEEP_ALIVE", None)
+
+            ollama_llm.generate_response(
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        assert params["keep_alive"] == "30m"
+
+    def test_custom_keep_alive(self, ollama_llm):
+        """Custom keep_alive from MEM0_OLLAMA_KEEP_ALIVE env var."""
+        mock_response = MagicMock()
+        mock_response.message.content = "test"
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        with patch.dict("os.environ", {"MEM0_OLLAMA_KEEP_ALIVE": "1h"}, clear=False):
+            ollama_llm.generate_response(
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        params = ollama_llm.client.chat.call_args.kwargs
+        assert params["keep_alive"] == "1h"
+
+
+class TestRetryLogic:
+    def test_retry_on_empty_string(self, ollama_llm):
+        """Empty JSON response triggers a retry."""
+        first_response = MagicMock()
+        first_response.message.content = ""
+        first_response.message.tool_calls = None
+
+        second_response = MagicMock()
+        second_response.message.content = '{"facts": ["a"]}'
+        second_response.message.tool_calls = None
+
+        ollama_llm.client.chat.side_effect = [first_response, second_response]
+
+        result = ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "extract"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result == '{"facts": ["a"]}'
+        assert ollama_llm.client.chat.call_count == 2
+
+    def test_retry_on_invalid_json(self, ollama_llm):
+        """Invalid JSON response triggers a retry."""
+        first_response = MagicMock()
+        first_response.message.content = "not json at all"
+        first_response.message.tool_calls = None
+
+        second_response = MagicMock()
+        second_response.message.content = '{"facts": ["b"]}'
+        second_response.message.tool_calls = None
+
+        ollama_llm.client.chat.side_effect = [first_response, second_response]
+
+        result = ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "extract"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result == '{"facts": ["b"]}'
+        assert ollama_llm.client.chat.call_count == 2
+
+    def test_retry_on_empty_object(self, ollama_llm):
+        """Empty object {} triggers a retry."""
+        first_response = MagicMock()
+        first_response.message.content = "{}"
+        first_response.message.tool_calls = None
+
+        second_response = MagicMock()
+        second_response.message.content = '{"facts": ["c"]}'
+        second_response.message.tool_calls = None
+
+        ollama_llm.client.chat.side_effect = [first_response, second_response]
+
+        result = ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "extract"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result == '{"facts": ["c"]}'
+        assert ollama_llm.client.chat.call_count == 2
+
+    def test_no_retry_on_valid_json(self, ollama_llm):
+        """Valid JSON does not trigger a retry."""
+        mock_response = MagicMock()
+        mock_response.message.content = '{"facts": ["valid"]}'
+        mock_response.message.tool_calls = None
+        ollama_llm.client.chat.return_value = mock_response
+
+        result = ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "extract"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result == '{"facts": ["valid"]}'
+        assert ollama_llm.client.chat.call_count == 1
+
+    def test_retry_limit_is_one(self, ollama_llm):
+        """Both attempts fail: returns second result, logs error."""
+        first_response = MagicMock()
+        first_response.message.content = ""
+        first_response.message.tool_calls = None
+
+        second_response = MagicMock()
+        second_response.message.content = ""
+        second_response.message.tool_calls = None
+
+        ollama_llm.client.chat.side_effect = [first_response, second_response]
+
+        result = ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "extract"}],
+            response_format={"type": "json_object"},
+        )
+
+        # Returns the (empty) retry result — no infinite loop
+        assert result == ""
+        assert ollama_llm.client.chat.call_count == 2
+
+    def test_no_retry_for_tool_calling(self, ollama_llm):
+        """Tool-calling requests never trigger retry, even with empty content."""
+        mock_response = MagicMock()
+        mock_response.message.content = ""
+        mock_response.message.tool_calls = []
+        ollama_llm.client.chat.return_value = mock_response
+
+        ollama_llm.generate_response(
+            messages=[{"role": "user", "content": "extract"}],
+            tools=SAMPLE_TOOLS,
+        )
+
+        assert ollama_llm.client.chat.call_count == 1

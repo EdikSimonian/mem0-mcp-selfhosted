@@ -380,6 +380,19 @@ class TestBuildConfig:
         _, _, split_config3 = self._build_with_env(env3)
         assert split_config3["contradiction_ollama_base_url"] == "http://localhost:11434"
 
+    # --- Qdrant timeout (11.x) ---
+
+    def test_qdrant_timeout_from_env(self):
+        """MEM0_QDRANT_TIMEOUT sets integer timeout in vector_config."""
+        env = {"MEM0_QDRANT_TIMEOUT": "30"}
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["vector_store"]["config"]["timeout"] == 30
+
+    def test_qdrant_timeout_absent_when_not_set(self):
+        """No timeout key in vector_config when MEM0_QDRANT_TIMEOUT is not set."""
+        config_dict, *_ = self._build_with_env({})
+        assert "timeout" not in config_dict["vector_store"]["config"]
+
     def test_contradiction_llm_url_not_affected_by_embed_url(self):
         """Changing MEM0_EMBED_URL does NOT affect contradiction LLM URL."""
         env = {

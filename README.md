@@ -177,6 +177,8 @@ All configuration is via environment variables. Create a `.env` file or set them
 | `GOOGLE_API_KEY` | -- | Google API key (required for `gemini`/`gemini_split` graph providers) |
 | `MEM0_GRAPH_CONTRADICTION_LLM_PROVIDER` | `anthropic` | Contradiction LLM provider in `gemini_split` mode (`anthropic`, `anthropic_oat`, `ollama`) |
 | `MEM0_GRAPH_CONTRADICTION_LLM_MODEL` | _(inherits MEM0_LLM_MODEL)_ | Contradiction model in `gemini_split` mode |
+| `MEM0_OLLAMA_KEEP_ALIVE` | `30m` | How long Ollama keeps the model in VRAM between calls (e.g., `1h`, `5m`). Prevents model unload during multi-call graph pipelines |
+| `MEM0_OLLAMA_THINK` | `false` | Set to `true` to re-enable qwen3 thinking mode (disabled by default to prevent `<think>` + `format:"json"` collision) |
 
 ### Embedder
 
@@ -194,6 +196,7 @@ All configuration is via environment variables. Create a `.env` file or set them
 | `MEM0_QDRANT_URL` | `http://localhost:6333` | Qdrant REST API URL |
 | `MEM0_QDRANT_API_KEY` | -- | Qdrant API key (for Qdrant Cloud) |
 | `MEM0_QDRANT_ON_DISK` | `false` | Store vectors on disk (reduces RAM, slower search) |
+| `MEM0_QDRANT_TIMEOUT` | _(client default)_ | Qdrant REST API timeout in seconds (e.g., `30`). Only set if you hit `ReadTimeout` during collection operations |
 | `MEM0_COLLECTION` | `mem0_mcp_selfhosted` | Qdrant collection name |
 
 ### Graph Store (Neo4j)
