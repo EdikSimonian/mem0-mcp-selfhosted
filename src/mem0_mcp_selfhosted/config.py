@@ -23,6 +23,19 @@ def _bool_env(key: str, default: str = "false") -> bool:
     return os.environ.get(key, default).lower() in ("true", "1", "yes")
 
 
+def _resolve_ollama_url(*env_keys: str) -> str:
+    """Resolve the Ollama base URL from a priority chain of env vars.
+
+    Checks each key in *env_keys* first, then falls back to
+    ``MEM0_OLLAMA_URL``, then ``"http://localhost:11434"``.
+    """
+    for key in env_keys:
+        val = os.environ.get(key)
+        if val:
+            return val
+    return os.environ.get("MEM0_OLLAMA_URL", "http://localhost:11434")
+
+
 def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] | None]:
     """Build mem0ai MemoryConfig dict and provider registration info.
 
@@ -33,12 +46,16 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
     """
     token = resolve_token()
 
+    # --- Top-level provider default (cascades to LLM and graph LLM) ---
+    _provider_default = os.environ.get("MEM0_PROVIDER", "anthropic")
+
     # --- LLM ---
-    llm_provider = os.environ.get("MEM0_LLM_PROVIDER", "anthropic")
+    llm_provider = os.environ.get("MEM0_LLM_PROVIDER", _provider_default)
     _supported_llm_providers = ("anthropic", "ollama")
     if llm_provider not in _supported_llm_providers:
         raise ValueError(
-            f"Unsupported MEM0_LLM_PROVIDER={llm_provider!r}. "
+            f"Unsupported LLM provider {llm_provider!r} "
+            f"(from MEM0_LLM_PROVIDER or MEM0_PROVIDER). "
             f"Supported: {list(_supported_llm_providers)}"
         )
 
@@ -52,14 +69,12 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         if token:
             llm_config["api_key"] = token
     elif llm_provider == "ollama":
-        llm_config["ollama_base_url"] = os.environ.get(
-            "MEM0_LLM_URL", "http://localhost:11434"
-        )
+        llm_config["ollama_base_url"] = _resolve_ollama_url("MEM0_LLM_URL")
 
     # --- Embedder ---
     embed_provider = os.environ.get("MEM0_EMBED_PROVIDER", "ollama")
     embed_model = os.environ.get("MEM0_EMBED_MODEL", "bge-m3")
-    embed_url = os.environ.get("MEM0_EMBED_URL", "http://localhost:11434")
+    embed_url = _resolve_ollama_url("MEM0_EMBED_URL")
     embed_dims = int(os.environ.get("MEM0_EMBED_DIMS", "1024"))
 
     embedder_config: dict[str, Any] = {
@@ -143,7 +158,7 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
             graph_neo4j_config["base_label"] = neo4j_base_label
 
         # Graph LLM — MUST be explicit (mem0ai defaults to "openai" if omitted)
-        graph_llm_provider_raw = os.environ.get("MEM0_GRAPH_LLM_PROVIDER", "anthropic")
+        graph_llm_provider_raw = os.environ.get("MEM0_GRAPH_LLM_PROVIDER", _provider_default)
         graph_llm_provider = graph_llm_provider_raw
         graph_llm_model = os.environ.get("MEM0_GRAPH_LLM_MODEL", llm_model)
 
@@ -152,11 +167,9 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         }
 
         if graph_llm_provider == "ollama":
-            graph_llm_url = os.environ.get(
-                "MEM0_GRAPH_LLM_URL",
-                os.environ.get("MEM0_LLM_URL", "http://localhost:11434"),
+            graph_llm_config["ollama_base_url"] = _resolve_ollama_url(
+                "MEM0_GRAPH_LLM_URL", "MEM0_LLM_URL"
             )
-            graph_llm_config["ollama_base_url"] = graph_llm_url
         elif graph_llm_provider in ("anthropic", "anthropic_oat"):
             if token:
                 graph_llm_config["api_key"] = token
@@ -250,9 +263,8 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         if contradiction_provider in ("anthropic", "anthropic_oat") and token:
             split_config["contradiction_api_key"] = token
         elif contradiction_provider == "ollama":
-            split_config["contradiction_ollama_base_url"] = os.environ.get(
-                "MEM0_GRAPH_LLM_URL",
-                os.environ.get("MEM0_LLM_URL", "http://localhost:11434"),
+            split_config["contradiction_ollama_base_url"] = _resolve_ollama_url(
+                "MEM0_GRAPH_LLM_URL", "MEM0_LLM_URL"
             )
 
     return config_dict, providers_info, split_config

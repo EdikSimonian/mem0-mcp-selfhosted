@@ -222,7 +222,7 @@ class TestBuildConfig:
                     patched_env.pop(k, None)
             with patch("mem0_mcp_selfhosted.config.resolve_token", return_value="sk-test"):
                 from mem0_mcp_selfhosted.config import build_config
-                with pytest.raises(ValueError, match="Unsupported MEM0_LLM_PROVIDER='gemini'"):
+                with pytest.raises(ValueError, match="Unsupported LLM provider 'gemini'"):
                     build_config()
 
     def test_anthropic_config_has_api_key_and_max_tokens(self):
@@ -484,3 +484,158 @@ class TestBuildConfig:
         _, _, split_config = self._build_with_env(env)
         # Should be default, NOT the embed URL
         assert split_config["contradiction_ollama_base_url"] == "http://localhost:11434"
+
+    # --- MEM0_PROVIDER cascade (12.x) ---
+
+    def test_mem0_provider_cascades_to_llm(self):
+        """MEM0_PROVIDER=ollama alone sets LLM provider to ollama."""
+        env = {"MEM0_PROVIDER": "ollama"}
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["llm"]["provider"] == "ollama"
+
+    def test_llm_provider_overrides_mem0_provider(self):
+        """MEM0_LLM_PROVIDER takes precedence over MEM0_PROVIDER."""
+        env = {"MEM0_PROVIDER": "ollama", "MEM0_LLM_PROVIDER": "anthropic"}
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["llm"]["provider"] == "anthropic"
+
+    def test_neither_provider_set_defaults_to_anthropic(self):
+        """Neither MEM0_PROVIDER nor MEM0_LLM_PROVIDER → defaults to anthropic."""
+        config_dict, *_ = self._build_with_env({})
+        assert config_dict["llm"]["provider"] == "anthropic"
+
+    def test_mem0_provider_cascades_to_graph_llm(self):
+        """MEM0_PROVIDER=ollama cascades to graph LLM provider."""
+        env = {"MEM0_PROVIDER": "ollama", "MEM0_ENABLE_GRAPH": "true"}
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["graph_store"]["llm"]["provider"] == "ollama"
+
+    def test_graph_llm_provider_overrides_mem0_provider(self):
+        """MEM0_GRAPH_LLM_PROVIDER takes precedence over MEM0_PROVIDER."""
+        env = {
+            "MEM0_PROVIDER": "ollama",
+            "MEM0_ENABLE_GRAPH": "true",
+            "MEM0_GRAPH_LLM_PROVIDER": "gemini_split",
+            "GOOGLE_API_KEY": "test-key",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        # gemini_split maps to "gemini" in the config dict
+        assert config_dict["graph_store"]["llm"]["provider"] == "gemini"
+
+    def test_mem0_provider_does_not_cascade_to_embed(self):
+        """MEM0_PROVIDER does NOT cascade to embed provider (stays ollama)."""
+        env = {"MEM0_PROVIDER": "anthropic"}
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["embedder"]["provider"] == "ollama"
+
+    def test_invalid_mem0_provider_raises_valueerror(self):
+        """Invalid MEM0_PROVIDER raises ValueError when MEM0_LLM_PROVIDER not set."""
+        leak_keys = [k for k in os.environ if k.startswith("MEM0_")]
+        env = {"MEM0_PROVIDER": "unsupported"}
+        with patch.dict("os.environ", env, clear=False) as patched_env:
+            for k in leak_keys:
+                if k not in env:
+                    patched_env.pop(k, None)
+            with patch("mem0_mcp_selfhosted.config.resolve_token", return_value="sk-test"):
+                from mem0_mcp_selfhosted.config import build_config
+                with pytest.raises(ValueError, match="Unsupported LLM provider"):
+                    build_config()
+
+    # --- MEM0_OLLAMA_URL cascade (13.x) ---
+
+    def test_ollama_url_cascades_to_llm(self):
+        """MEM0_OLLAMA_URL sets LLM ollama_base_url when MEM0_LLM_URL not set."""
+        env = {"MEM0_LLM_PROVIDER": "ollama", "MEM0_OLLAMA_URL": "http://192.168.0.208:11434"}
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["llm"]["config"]["ollama_base_url"] == "http://192.168.0.208:11434"
+
+    def test_llm_url_overrides_ollama_url(self):
+        """MEM0_LLM_URL takes precedence over MEM0_OLLAMA_URL for LLM."""
+        env = {
+            "MEM0_LLM_PROVIDER": "ollama",
+            "MEM0_OLLAMA_URL": "http://192.168.0.208:11434",
+            "MEM0_LLM_URL": "http://10.0.0.5:11434",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["llm"]["config"]["ollama_base_url"] == "http://10.0.0.5:11434"
+
+    def test_ollama_url_cascades_to_embed(self):
+        """MEM0_OLLAMA_URL sets embed ollama_base_url when MEM0_EMBED_URL not set."""
+        env = {"MEM0_OLLAMA_URL": "http://192.168.0.208:11434"}
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["embedder"]["config"]["ollama_base_url"] == "http://192.168.0.208:11434"
+
+    def test_embed_url_overrides_ollama_url(self):
+        """MEM0_EMBED_URL takes precedence over MEM0_OLLAMA_URL for embed."""
+        env = {
+            "MEM0_OLLAMA_URL": "http://192.168.0.208:11434",
+            "MEM0_EMBED_URL": "http://10.0.0.5:11434",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["embedder"]["config"]["ollama_base_url"] == "http://10.0.0.5:11434"
+
+    def test_ollama_url_cascades_to_graph_llm_4_level(self):
+        """MEM0_OLLAMA_URL in graph LLM 4-level cascade: GRAPH_LLM_URL > LLM_URL > OLLAMA_URL > localhost."""
+        # Only MEM0_OLLAMA_URL set
+        env = {
+            "MEM0_ENABLE_GRAPH": "true",
+            "MEM0_GRAPH_LLM_PROVIDER": "ollama",
+            "MEM0_OLLAMA_URL": "http://192.168.0.208:11434",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["graph_store"]["llm"]["config"]["ollama_base_url"] == "http://192.168.0.208:11434"
+
+        # MEM0_LLM_URL overrides MEM0_OLLAMA_URL
+        env2 = {
+            "MEM0_ENABLE_GRAPH": "true",
+            "MEM0_GRAPH_LLM_PROVIDER": "ollama",
+            "MEM0_OLLAMA_URL": "http://192.168.0.208:11434",
+            "MEM0_LLM_URL": "http://10.0.0.5:11434",
+        }
+        config_dict2, *_ = self._build_with_env(env2)
+        assert config_dict2["graph_store"]["llm"]["config"]["ollama_base_url"] == "http://10.0.0.5:11434"
+
+        # MEM0_GRAPH_LLM_URL takes highest precedence
+        env3 = {
+            "MEM0_ENABLE_GRAPH": "true",
+            "MEM0_GRAPH_LLM_PROVIDER": "ollama",
+            "MEM0_OLLAMA_URL": "http://192.168.0.208:11434",
+            "MEM0_LLM_URL": "http://10.0.0.5:11434",
+            "MEM0_GRAPH_LLM_URL": "http://gpu-box:11434",
+        }
+        config_dict3, *_ = self._build_with_env(env3)
+        assert config_dict3["graph_store"]["llm"]["config"]["ollama_base_url"] == "http://gpu-box:11434"
+
+    def test_ollama_url_ignored_for_anthropic_provider(self):
+        """MEM0_OLLAMA_URL is ignored when LLM provider is anthropic."""
+        env = {"MEM0_OLLAMA_URL": "http://192.168.0.208:11434"}
+        config_dict, *_ = self._build_with_env(env)
+        assert "ollama_base_url" not in config_dict["llm"]["config"]
+
+    def test_ollama_url_cascades_to_contradiction_llm(self):
+        """MEM0_OLLAMA_URL cascades to contradiction LLM URL for gemini_split."""
+        env = {
+            "MEM0_ENABLE_GRAPH": "true",
+            "MEM0_GRAPH_LLM_PROVIDER": "gemini_split",
+            "GOOGLE_API_KEY": "test-key",
+            "MEM0_GRAPH_CONTRADICTION_LLM_PROVIDER": "ollama",
+            "MEM0_OLLAMA_URL": "http://192.168.0.208:11434",
+        }
+        _, _, split_config = self._build_with_env(env)
+        assert split_config["contradiction_ollama_base_url"] == "http://192.168.0.208:11434"
+
+    # --- End-to-end cascade (14.x) ---
+
+    def test_two_env_vars_configure_full_ollama_stack(self):
+        """MEM0_PROVIDER + MEM0_OLLAMA_URL configure LLM, embed, and graph in one shot."""
+        env = {
+            "MEM0_PROVIDER": "ollama",
+            "MEM0_OLLAMA_URL": "http://192.168.0.208:11434",
+            "MEM0_ENABLE_GRAPH": "true",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["llm"]["provider"] == "ollama"
+        assert config_dict["llm"]["config"]["ollama_base_url"] == "http://192.168.0.208:11434"
+        assert config_dict["embedder"]["config"]["ollama_base_url"] == "http://192.168.0.208:11434"
+        assert config_dict["graph_store"]["llm"]["provider"] == "ollama"
+        assert config_dict["graph_store"]["llm"]["config"]["ollama_base_url"] == "http://192.168.0.208:11434"
