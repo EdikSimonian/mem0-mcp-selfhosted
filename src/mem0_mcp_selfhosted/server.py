@@ -20,12 +20,16 @@ from pydantic import Field
 
 from mem0_mcp_selfhosted.config import ProviderInfo, build_config
 from mem0_mcp_selfhosted.env import bool_env, env
-from mem0_mcp_selfhosted.graph_tools import get_entity, search_graph
+from mem0_mcp_selfhosted.graph_tools import (
+    find_entity as _find_entity_impl,
+    get_entity as _get_entity_impl,
+)
 from mem0_mcp_selfhosted.helpers import (
     _mem0_call,
     call_with_graph,
     get_default_user_id,
     list_entities_facet,
+    patch_extract_relations_prompt,
     patch_gemini_parse_response,
     patch_graph_sanitizer,
     safe_bulk_delete,
@@ -94,9 +98,10 @@ def _init_memory() -> Any:
 
     register_providers(providers_info)
 
-    # Patch mem0ai's relationship sanitizer before Memory init
+    # Patch mem0ai's relationship sanitizer + extraction prompt before Memory init
     patch_graph_sanitizer()
     patch_gemini_parse_response()
+    patch_extract_relations_prompt()
 
     # Initialize Memory
     from mem0 import Memory
@@ -162,7 +167,7 @@ def _create_server() -> FastMCP:
             "Use search_memories to find relevant context before starting work. "
             "Use add_memory to store important facts, preferences, and decisions. "
             "Use get_memories to browse stored memories with filters. "
-            "Use search_graph to find relationships between entities. "
+            "Use find_entity (substring name lookup) and get_entity (exact bidirectional profile) for graph navigation. "
             "Use get_memory to retrieve a specific memory by ID. "
             "Use update_memory to modify existing memories. "
             "Use list_entities to see who/what has stored memories."
@@ -235,7 +240,9 @@ def _register_tools(mcp: FastMCP) -> None:
         """Semantic search across existing memories."""
         uid = user_id or get_default_user_id()
 
-        kwargs: dict[str, Any] = {"user_id": uid, "query": query}
+        kwargs: dict[str, Any] = {"query": query}
+        if uid:
+            kwargs["user_id"] = uid
         if agent_id:
             kwargs["agent_id"] = agent_id
         if run_id:
@@ -266,7 +273,9 @@ def _register_tools(mcp: FastMCP) -> None:
         """Page through memories using filters instead of search."""
         uid = user_id or get_default_user_id()
 
-        kwargs: dict[str, Any] = {"user_id": uid}
+        kwargs: dict[str, Any] = {}
+        if uid:
+            kwargs["user_id"] = uid
         if agent_id:
             kwargs["agent_id"] = agent_id
         if run_id:
@@ -308,8 +317,15 @@ def _register_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def delete_memory(
         memory_id: Annotated[str, Field(description="Exact memory UUID to delete.")],
+        enable_graph: Annotated[bool | None, Field(description="Override default graph toggle. When true, also cleans up graph entities extracted from this memory's text.")] = None,
     ) -> str:
-        """Delete a single memory."""
+        """Delete a single memory.
+
+        If graph is enabled, mem0ai's Memory.delete() re-extracts entities from
+        the memory text and soft-deletes matching graph relationships. Without
+        the per-call enable_graph route, mem.enable_graph would be whatever the
+        last call left it at — racy and effectively non-deterministic.
+        """
         mem = _ensure_memory()
         if mem is None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
@@ -318,13 +334,14 @@ def _register_tools(mcp: FastMCP) -> None:
             mem.delete(memory_id)
             return {"message": "Memory deleted successfully!"}
 
-        return _mem0_call(_do_delete)
+        return _mem0_call(call_with_graph, mem, enable_graph, _enable_graph_default, _do_delete)
 
     @mcp.tool()
     def delete_all_memories(
         user_id: Annotated[str | None, Field(description="User scope to delete.")] = None,
         agent_id: Annotated[str | None, Field(description="Agent scope to delete.")] = None,
         run_id: Annotated[str | None, Field(description="Run scope to delete.")] = None,
+        enable_graph: Annotated[bool | None, Field(description="Override default graph toggle. When true, also calls graph.delete_all(filters) to clean Neo4j.")] = None,
     ) -> str:
         """Bulk-delete all memories in the given scope. Requires at least one filter.
 
@@ -349,8 +366,10 @@ def _register_tools(mcp: FastMCP) -> None:
         if mem is None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
 
+        graph_enabled = enable_graph if enable_graph is not None else _enable_graph_default
+
         def _do_bulk_delete():
-            count = safe_bulk_delete(mem, filters, graph_enabled=_enable_graph_default)
+            count = safe_bulk_delete(mem, filters, graph_enabled=graph_enabled)
             return {"message": f"Deleted {count} memories.", "count": count}
 
         return _mem0_call(_do_bulk_delete)
@@ -414,18 +433,23 @@ def _register_tools(mcp: FastMCP) -> None:
     # ============================================================
 
     @mcp.tool()
-    def mcp_search_graph(
-        query: Annotated[str, Field(description="Entity or topic to search for (e.g., 'Python', 'TypeScript').")],
+    def find_entity(
+        query: Annotated[str, Field(description="Substring of an entity name, case-insensitive (e.g. 'helios', 'kuber'). Use '*' or '' to list up to 100 entities. NOT a natural-language query.")],
     ) -> str:
-        """Search entities by name/id substring matching in Neo4j knowledge graph."""
-        return search_graph(query)
+        """Find graph entities by case-insensitive name substring (up to 25 matches with outgoing edges).
+
+        NOT semantic search. For natural-language questions ("who maintains X"),
+        call search_memories first to find relevant memories, then resolve specific
+        entity names with this tool or get_entity.
+        """
+        return _find_entity_impl(query)
 
     @mcp.tool()
-    def mcp_get_entity(
-        name: Annotated[str, Field(description="Exact entity name to look up.")],
+    def get_entity(
+        name: Annotated[str, Field(description="Exact entity name to look up (case-insensitive equality, no substring).")],
     ) -> str:
-        """Get all relationships for a specific entity (bidirectional)."""
-        return get_entity(name)
+        """Get the full bidirectional relationship profile for one entity (incoming + outgoing edges)."""
+        return _get_entity_impl(name)
 
 
 # ============================================================
@@ -446,7 +470,7 @@ def _register_prompts(mcp: FastMCP) -> None:
             "2. Search memories: Use search_memories for semantic queries\n"
             "3. Browse memories: Use get_memories for filtered listing\n"
             "4. Update/Delete: Use update_memory and delete_memory for modifications\n"
-            "5. Graph exploration: Use search_graph and get_entity for entity relationships\n\n"
+            "5. Graph exploration: find_entity for substring lookup, get_entity for exact bidirectional profile\n\n"
             "Tips:\n"
             "- user_id is automatically injected from MEM0_USER_ID default\n"
             "- Set enable_graph=true to include knowledge graph results\n"

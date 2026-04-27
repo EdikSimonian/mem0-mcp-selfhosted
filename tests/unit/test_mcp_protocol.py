@@ -23,8 +23,8 @@ EXPECTED_TOOLS = {
     "delete_all_memories",
     "list_entities",
     "delete_entities",
-    "mcp_search_graph",
-    "mcp_get_entity",
+    "find_entity",
+    "get_entity",
 }
 
 # Required parameters per tool (tool_name -> set of required param names)
@@ -38,8 +38,8 @@ REQUIRED_PARAMS = {
     "delete_all_memories": set(),
     "list_entities": set(),
     "delete_entities": set(),
-    "mcp_search_graph": {"query"},
-    "mcp_get_entity": {"name"},
+    "find_entity": {"query"},
+    "get_entity": {"name"},
 }
 
 

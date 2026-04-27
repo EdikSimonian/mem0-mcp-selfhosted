@@ -211,8 +211,27 @@ def _read_recent_messages(transcript_path: str) -> list[tuple[str, str]]:
     return list(messages)
 
 
+_STATE_DIR = Path("/tmp/mem0-session-state")
+
+
+def _log_session_event(session_id: str, **fields) -> None:
+    """Append a per-Stop result line to the session state file.
+
+    SessionEnd hook reads this file to summarize what mem0 recorded
+    across the whole session. Best-effort: any I/O error is swallowed.
+    """
+    if not session_id:
+        return
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_STATE_DIR / f"{session_id}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(fields) + "\n")
+    except OSError:
+        pass
+
+
 def stop_main() -> None:
-    """Stop hook: save session summary to mem0."""
+    """Stop hook: save session summary to mem0. Silent — no per-turn UI notice."""
     try:
         hook_input = json.loads(sys.stdin.read())
 
@@ -260,7 +279,7 @@ def stop_main() -> None:
         mem = _get_memory()
         user_id = _get_user_id()
 
-        mem.add(
+        result = mem.add(
             messages=[{"role": "user", "content": summary}],
             user_id=user_id,
             infer=True,
@@ -269,6 +288,16 @@ def stop_main() -> None:
                 "session_id": session_id,
             },
         )
+
+        records = (
+            result.get("results", [])
+            if isinstance(result, dict)
+            else (result if isinstance(result, list) else [])
+        )
+        events = [r.get("event", "") for r in records if isinstance(r, dict)]
+        added = sum(1 for e in events if e == "ADD")
+        updated = sum(1 for e in events if e == "UPDATE")
+        _log_session_event(session_id, added=added, updated=updated)
 
         _output(_nonfatal())
 
@@ -371,7 +400,10 @@ def install_main() -> None:
     else:
         project_dir = Path(args.project_dir) if args.project_dir else Path.cwd()
         if not project_dir.is_dir():
-            print(f"Error: project directory does not exist: {project_dir}", file=sys.stderr)
+            print(
+                f"Error: project directory does not exist: {project_dir}",
+                file=sys.stderr,
+            )
             sys.exit(1)
         settings_dir = project_dir / ".claude"
 
@@ -408,14 +440,18 @@ def install_main() -> None:
     if _has_hook(hooks["SessionStart"], _HOOK_CONTEXT_CMD):
         skipped.append(f"SessionStart ({_HOOK_CONTEXT_CMD})")
     else:
-        hooks["SessionStart"].append({
-            "matcher": "startup|compact",
-            "hooks": [{
-                "type": "command",
-                "command": _HOOK_CONTEXT_CMD,
-                "timeout": 15000,
-            }],
-        })
+        hooks["SessionStart"].append(
+            {
+                "matcher": "startup|compact",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": _HOOK_CONTEXT_CMD,
+                        "timeout": 15000,
+                    }
+                ],
+            }
+        )
         installed.append(f"SessionStart ({_HOOK_CONTEXT_CMD})")
 
     # --- Stop hook ---
@@ -424,13 +460,17 @@ def install_main() -> None:
     if _has_hook(hooks["Stop"], _HOOK_STOP_CMD):
         skipped.append(f"Stop ({_HOOK_STOP_CMD})")
     else:
-        hooks["Stop"].append({
-            "hooks": [{
-                "type": "command",
-                "command": _HOOK_STOP_CMD,
-                "timeout": 30000,
-            }],
-        })
+        hooks["Stop"].append(
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": _HOOK_STOP_CMD,
+                        "timeout": 30000,
+                    }
+                ],
+            }
+        )
         installed.append(f"Stop ({_HOOK_STOP_CMD})")
 
     # Atomic write: temp file + rename avoids truncated settings on crash

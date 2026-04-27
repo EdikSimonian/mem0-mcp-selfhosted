@@ -12,8 +12,9 @@ build/
 venv/
 env/
 
-# pytest
+# pytest / ruff
 .pytest_cache/
+.ruff_cache/
 
 # IDE
 .idea/
@@ -21,7 +22,7 @@ env/
 *.swp
 *.swo
 
-# Environment
+# Environment files (no leading slash → matches at any depth, e.g. setup/.env)
 .env
 .env.local
 
@@ -42,3 +43,10 @@ benchmarks/*results*.json
 .claude/
 openspec/
 docs/
+
+# Compose stack runtime data lives outside the repo (MEM0_DATA_DIR points at
+# ~/.mem0-stack by default). These globs catch accidental in-tree copies.
+setup/volumes/
+setup/backups/
+volumes/
+backups/

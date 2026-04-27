@@ -45,7 +45,7 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
 
     # --- Top-level provider default (cascades to LLM and graph LLM) ---
     _provider_default = env("MEM0_PROVIDER", "anthropic")
-    _supported_llm_providers = ("anthropic", "ollama")
+    _supported_llm_providers = ("anthropic", "ollama", "openai")
     if _provider_default not in _supported_llm_providers:
         raise ValueError(
             f"Unsupported MEM0_PROVIDER={_provider_default!r}. "
@@ -60,7 +60,11 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
             f"Supported: {list(_supported_llm_providers)}"
         )
 
-    _llm_model_defaults = {"anthropic": "claude-opus-4-6", "ollama": "qwen3:14b"}
+    _llm_model_defaults = {
+        "anthropic": "claude-opus-4-6",
+        "ollama": "qwen3:14b",
+        "openai": "gpt-5.4-nano",
+    }
     llm_model = env("MEM0_LLM_MODEL", _llm_model_defaults[llm_provider])
     llm_max_tokens = int(env("MEM0_LLM_MAX_TOKENS", "16384"))
 
@@ -71,6 +75,16 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
             llm_config["api_key"] = token
     elif llm_provider == "ollama":
         llm_config["ollama_base_url"] = _resolve_ollama_url("MEM0_LLM_URL")
+    elif llm_provider == "openai":
+        # Works for OpenAI directly and any OpenAI-compatible gateway (LiteLLM,
+        # vLLM, etc.). Set MEM0_LLM_URL to the gateway base URL (must include
+        # /v1 path prefix, e.g. "https://litellm.example.com/v1").
+        openai_base = opt_env("MEM0_LLM_URL")
+        if openai_base:
+            llm_config["openai_base_url"] = openai_base
+        openai_key = opt_env("OPENAI_API_KEY")
+        if openai_key:
+            llm_config["api_key"] = openai_key
 
     # --- Embedder ---
     embed_provider = env("MEM0_EMBED_PROVIDER", "ollama")
@@ -183,6 +197,16 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
             if token:
                 graph_llm_config["api_key"] = token
             graph_llm_config["max_tokens"] = llm_max_tokens
+        elif graph_llm_provider == "openai":
+            # OpenAI-compatible (incl. LiteLLM gateway). Reuses MEM0_LLM_URL by
+            # default; override with MEM0_GRAPH_LLM_URL only if extraction needs
+            # a different gateway (e.g. routing extraction to a different model).
+            openai_base = env("MEM0_GRAPH_LLM_URL") or opt_env("MEM0_LLM_URL")
+            if openai_base:
+                graph_llm_config["openai_base_url"] = openai_base
+            openai_key = opt_env("OPENAI_API_KEY")
+            if openai_key:
+                graph_llm_config["api_key"] = openai_key
         elif graph_llm_provider == "gemini":
             # Use mem0ai's built-in GeminiLLM provider
             # Default to flash-lite (not the main Claude model) when no explicit model set

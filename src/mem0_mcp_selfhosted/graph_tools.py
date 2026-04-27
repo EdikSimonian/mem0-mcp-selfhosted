@@ -1,7 +1,8 @@
 """Direct Neo4j graph tools.
 
-Provides search_graph and get_entity via Cypher queries with a
-lazily-initialized Neo4j driver separate from mem0ai's graph store.
+Provides find_entity (substring name lookup) and get_entity (exact name
+profile) via Cypher queries with a lazily-initialized Neo4j driver
+separate from mem0ai's graph store.
 """
 
 from __future__ import annotations
@@ -56,8 +57,13 @@ def _run_query(query: str, params: dict[str, Any] | None = None) -> list[dict]:
         return [record.data() for record in result]
 
 
-def search_graph(query: str) -> str:
-    """Search entities by name substring in Neo4j.
+def find_entity(query: str) -> str:
+    """Find graph entities by case-insensitive name substring.
+
+    NOT a semantic search. For natural-language questions like
+    "who maintains Helios", call ``search_memories`` first to surface
+    relevant text, then resolve specific entity names with this or
+    ``get_entity``.
 
     Returns matching entities and their outgoing relationships.
     Pass '*' or empty string to list all entities (up to 100).
@@ -109,7 +115,7 @@ def search_graph(query: str) -> str:
             ensure_ascii=False,
         )
     except Exception as exc:
-        logger.error("search_graph failed: %s", exc)
+        logger.error("find_entity failed: %s", exc)
         return json.dumps(
             {"error": type(exc).__name__, "detail": str(exc)},
             ensure_ascii=False,

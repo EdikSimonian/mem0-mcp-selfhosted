@@ -35,12 +35,12 @@ class TestLazyDriverInit:
         assert gt._get_driver() is mock_driver
 
 
-class TestSearchGraph:
+class TestFindEntity:
     def test_neo4j_unavailable_returns_error(self):
         """Returns structured error when Neo4j is unreachable."""
         gt._driver = None
         with patch("mem0_mcp_selfhosted.graph_tools._get_driver", return_value=None):
-            result = json.loads(gt.search_graph("Alice"))
+            result = json.loads(gt.find_entity("Alice"))
             assert result["error"] == "graph_unavailable"
 
     def test_successful_search(self):
@@ -62,7 +62,7 @@ class TestSearchGraph:
 
         gt._driver = mock_driver
         with patch.dict("os.environ", {}, clear=False):
-            result = json.loads(gt.search_graph("Alice"))
+            result = json.loads(gt.find_entity("Alice"))
 
         assert "entities" in result
         assert len(result["entities"]) == 1
@@ -92,7 +92,7 @@ class TestSearchGraph:
         ])
         gt._driver = mock_driver
         with patch.dict("os.environ", {}, clear=False):
-            result = json.loads(gt.search_graph("*"))
+            result = json.loads(gt.find_entity("*"))
 
         assert "entities" in result
         assert len(result["entities"]) == 2
@@ -108,7 +108,7 @@ class TestSearchGraph:
         ])
         gt._driver = mock_driver
         with patch.dict("os.environ", {}, clear=False):
-            result = json.loads(gt.search_graph(""))
+            result = json.loads(gt.find_entity(""))
 
         assert "entities" in result
         cypher_arg = mock_session.run.call_args[0][0]
@@ -119,7 +119,7 @@ class TestSearchGraph:
         mock_driver, mock_session = self._make_mock_driver([])
         gt._driver = mock_driver
         with patch.dict("os.environ", {}, clear=False):
-            result = json.loads(gt.search_graph("   "))
+            result = json.loads(gt.find_entity("   "))
 
         assert "entities" in result
         cypher_arg = mock_session.run.call_args[0][0]
@@ -130,7 +130,7 @@ class TestSearchGraph:
         mock_driver, mock_session = self._make_mock_driver([])
         gt._driver = mock_driver
         with patch.dict("os.environ", {}, clear=False):
-            gt.search_graph("Alice")
+            gt.find_entity("Alice")
 
         cypher_arg = mock_session.run.call_args[0][0]
         assert "CONTAINS" in cypher_arg

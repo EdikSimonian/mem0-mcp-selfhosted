@@ -1,10 +1,13 @@
 # mem0-mcp-selfhosted
 
-<a href="https://glama.ai/mcp/servers/elvismdev/mem0-mcp-selfhosted"><img width="380" height="200" src="https://glama.ai/mcp/servers/elvismdev/mem0-mcp-selfhosted/badge?v=1" alt="mem0-mcp-selfhosted MCP server" /></a>
+Self-hosted [mem0](https://github.com/mem0ai/mem0) MCP server for Claude Code, with a bundled Qdrant + Neo4j docker-compose stack. Run a complete memory server against self-hosted infrastructure with your choice of Anthropic (Claude), an OpenAI-compatible gateway (LiteLLM), or fully local Ollama as the main LLM.
 
-Self-hosted [mem0](https://github.com/mem0ai/mem0) MCP server for Claude Code. Run a complete memory server against self-hosted Qdrant + Neo4j + Ollama, with your choice of Anthropic (Claude) or Ollama as the main LLM.
+This repo combines two pieces:
 
-Uses the `mem0ai` package directly as a library, supports both Claude's OAT token and fully local Ollama setups, and exposes 11 MCP tools for full memory management.
+- **The MCP server** at the repo root — Python package, uses the `mem0ai` library directly, exposes 11 MCP tools for full memory management. Fork of [`elvismdev/mem0-mcp-selfhosted`](https://github.com/elvismdev/mem0-mcp-selfhosted) (see [Attribution](#attribution)).
+- **A bundled stack** in [`setup/`](./setup/) — `docker-compose.yml` + helper scripts that bring up Qdrant + Neo4j locally, with persistent data outside the repo so it survives moves and clones. See [Bundled Stack](#bundled-stack-qdrant--neo4j) below.
+
+Supports Claude's OAT token (zero-config in Claude Code), standard Anthropic API keys, OpenAI-compatible gateways (LiteLLM, vLLM), and fully local Ollama setups.
 
 ## Prerequisites
 
@@ -28,7 +31,7 @@ Add the MCP server globally (available across all projects):
 ```bash
 claude mcp add --scope user --transport stdio mem0 \
   --env MEM0_USER_ID=your-user-id \
-  -- uvx --from git+https://github.com/elvismdev/mem0-mcp-selfhosted.git mem0-mcp-selfhosted
+  -- uvx --from git+https://github.com/EdikSimonian/mem0-mcp-selfhosted.git mem0-mcp-selfhosted
 ```
 
 All defaults work out of the box: Qdrant on `localhost:6333`, Ollama embeddings on `localhost:11434` with `bge-m3` (1024 dims). Override any default via `--env` (see [Configuration](#configuration)).
@@ -46,7 +49,7 @@ claude mcp add --scope user --transport stdio mem0 \
   --env MEM0_PROVIDER=ollama \
   --env MEM0_LLM_MODEL=qwen3:14b \
   --env MEM0_USER_ID=your-user-id \
-  -- uvx --from git+https://github.com/elvismdev/mem0-mcp-selfhosted.git mem0-mcp-selfhosted
+  -- uvx --from git+https://github.com/EdikSimonian/mem0-mcp-selfhosted.git mem0-mcp-selfhosted
 ```
 
 `MEM0_PROVIDER=ollama` cascades to both the main LLM and graph LLM providers. Same infrastructure defaults apply (Qdrant on `localhost:6333`, `bge-m3` embeddings). Per-service overrides (e.g. `MEM0_LLM_URL`, `MEM0_EMBED_URL`) still work when needed.
@@ -58,7 +61,7 @@ Or add it to a single project by creating `.mcp.json` in the project root:
   "mcpServers": {
     "mem0": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/elvismdev/mem0-mcp-selfhosted.git", "mem0-mcp-selfhosted"],
+      "args": ["--from", "git+https://github.com/EdikSimonian/mem0-mcp-selfhosted.git", "mem0-mcp-selfhosted"],
       "env": {
         "MEM0_PROVIDER": "ollama",
         "MEM0_LLM_MODEL": "qwen3:14b",
@@ -78,6 +81,35 @@ Restart Claude Code, then:
 > Remember that I prefer Hatch for Python packaging
 > Show me all entities in my knowledge graph
 ```
+
+## Bundled Stack (Qdrant + Neo4j)
+
+The [`setup/`](./setup/) folder ships a Docker Compose stack that runs Qdrant + Neo4j locally — useful if you don't already have those services running. Persistent data lives **outside** the repo (default: `~/.mem0-stack/`) so the data survives `git clean`, branch switches, and moving the repo.
+
+```bash
+# 1. Configure where data lives + pick ports/passwords
+cp setup/.env.example setup/.env
+# edit setup/.env and set MEM0_DATA_DIR to an absolute path, e.g. /Users/you/.mem0-stack
+
+# 2. Bring up Qdrant + Neo4j
+cd setup
+docker compose up -d
+
+# 3. (Optional) auto-register the MCP server using values from <repo>/.env
+./scripts/setup-mcp.sh
+```
+
+`setup/scripts/`:
+
+| Script | Purpose |
+|--------|---------|
+| `setup-mcp.sh` | Re-register the `mem0` MCP entry in Claude Code at user scope. Reads `<repo>/.env` and forwards every set variable to `claude mcp add`. Defaults `MEM0_FORK_PATH` to the repo root. |
+| `backup.sh` | Snapshot Qdrant collection + dump Neo4j graph (via APOC) into `$MEM0_DATA_DIR/backups/<timestamp>/`. Online — services stay up. |
+| `restore-qdrant.sh <snap>` | Restore a Qdrant `.snapshot` file into the running stack. |
+
+Embeddings still need Ollama running natively on the host (Compose intentionally does not bundle Ollama — model files are large and pre-pulled models are easier to manage on the host). Install Ollama, then `ollama pull bge-m3`.
+
+If you already run Qdrant + Neo4j elsewhere, skip `setup/` entirely and just point the MCP server at your existing endpoints via `MEM0_QDRANT_URL` / `MEM0_NEO4J_URL`.
 
 ## CLAUDE.md Integration
 
@@ -182,8 +214,8 @@ The server resolves an Anthropic token using a prioritized fallback chain:
 
 | Tool | Description |
 |------|-------------|
-| `search_graph` | Search Neo4j entities by name substring. Returns entities + outgoing relationships. |
-| `get_entity` | Get all relationships for an entity (bidirectional: incoming + outgoing). |
+| `find_entity` | Look up Neo4j entities by case-insensitive name substring (up to 25). Returns entities + outgoing relationships. NOT semantic search. |
+| `get_entity` | Get all relationships for one entity (bidirectional: incoming + outgoing). |
 
 ### Prompt
 
@@ -390,6 +422,24 @@ Contract tests catch breaking changes in `mem0ai` upgrades before they reach pro
 
 All mem0ai telemetry is suppressed. `os.environ["MEM0_TELEMETRY"] = "false"` is set at package import time, before any `mem0` module is loaded. No PostHog events are sent.
 
+## Attribution
+
+This is a fork of [`elvismdev/mem0-mcp-selfhosted`](https://github.com/elvismdev/mem0-mcp-selfhosted), which is itself built on top of [`mem0ai/mem0`](https://github.com/mem0ai/mem0). The fork adds:
+
+- The bundled Qdrant + Neo4j compose stack under [`setup/`](./setup/) with externalized data volumes
+- Bug fixes in graph cleanup (`call_with_graph` for thread-safety around `enable_graph`)
+- Additional MCP tools: `list_entities`, `find_entity`, `get_entity`, `delete_entities`
+- Anthropic LLM provider with OAT token support and proactive refresh
+- Split-model graph LLM router (`gemini_split`)
+
+Pull upstream changes with:
+
+```bash
+git remote add upstream https://github.com/elvismdev/mem0-mcp-selfhosted.git  # one-time
+git fetch upstream
+git merge upstream/main
+```
+
 ## License
 
-MIT
+MIT — see [`LICENSE`](./LICENSE).

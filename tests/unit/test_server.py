@@ -166,6 +166,21 @@ class TestDeleteMemory:
         parsed = json.loads(result)
         assert parsed["message"] == "Memory deleted successfully!"
 
+    @patch("mem0_mcp_selfhosted.server.call_with_graph")
+    def test_routes_through_call_with_graph(self, mock_cwg, server_with_mock):
+        """delete_memory must route through call_with_graph so mem.enable_graph
+        is set deterministically per request. Without this, graph cleanup is
+        racy — mem.enable_graph is whatever the last unrelated call left it at,
+        and Memory.delete() conditionally cleans Neo4j based on that flag."""
+        mock_cwg.return_value = None
+        srv, mem = server_with_mock
+        fn = _get_tool_fn(srv, "delete_memory")
+        fn(memory_id="uuid-123", enable_graph=True)
+        args, _ = mock_cwg.call_args
+        assert args[0] is mem
+        assert args[1] is True  # enable_graph from caller
+        assert args[2] is False  # _enable_graph_default from fixture
+
 
 class TestDeleteAllMemories:
     @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=0)
@@ -178,6 +193,17 @@ class TestDeleteAllMemories:
         mock_sbd.assert_called_once_with(mem, {"user_id": "test-user"}, graph_enabled=False)
         parsed = json.loads(result)
         assert parsed["count"] == 0
+
+    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=3)
+    def test_enable_graph_override_propagates(self, mock_sbd, server_with_mock):
+        """Per-call enable_graph=True must override the static _enable_graph_default,
+        otherwise users with graph-disabled defaults can never bulk-clean Neo4j
+        for a one-off cleanup."""
+        srv, _ = server_with_mock
+        fn = _get_tool_fn(srv, "delete_all_memories")
+        fn(user_id="alice", enable_graph=True)
+        _, kwargs = mock_sbd.call_args
+        assert kwargs["graph_enabled"] is True
 
     @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=3)
     def test_delegates_safe_bulk_delete(self, mock_sbd, server_with_mock):
@@ -220,19 +246,19 @@ class TestDeleteEntities:
 
 
 class TestGraphTools:
-    @patch("mem0_mcp_selfhosted.server.search_graph")
-    def test_search_graph_delegation(self, mock_sg, server_with_mock):
-        mock_sg.return_value = '{"entities": []}'
+    @patch("mem0_mcp_selfhosted.server._find_entity_impl")
+    def test_find_entity_delegation(self, mock_fe, server_with_mock):
+        mock_fe.return_value = '{"entities": []}'
         srv, _ = server_with_mock
-        fn = _get_tool_fn(srv, "mcp_search_graph")
+        fn = _get_tool_fn(srv, "find_entity")
         fn(query="Python")
-        mock_sg.assert_called_once_with("Python")
+        mock_fe.assert_called_once_with("Python")
 
-    @patch("mem0_mcp_selfhosted.server.get_entity")
+    @patch("mem0_mcp_selfhosted.server._get_entity_impl")
     def test_get_entity_delegation(self, mock_ge, server_with_mock):
         mock_ge.return_value = '{"relationships": []}'
         srv, _ = server_with_mock
-        fn = _get_tool_fn(srv, "mcp_get_entity")
+        fn = _get_tool_fn(srv, "get_entity")
         fn(name="TypeScript")
         mock_ge.assert_called_once_with("TypeScript")
 

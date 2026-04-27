@@ -13,6 +13,7 @@ from mem0_mcp_selfhosted.helpers import (
     _mem0_call,
     call_with_graph,
     get_default_user_id,
+    patch_extract_relations_prompt,
     patch_gemini_parse_response,
     safe_bulk_delete,
 )
@@ -349,3 +350,67 @@ class TestPatchGeminiParseResponse:
 
             result = patched_method(MagicMock(), response)
             assert result == ""
+
+
+class TestPatchExtractRelationsPrompt:
+    """Tests for the EXTRACT_RELATIONS_PROMPT augmentation patch."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_prompt(self):
+        """Save and restore the original prompt around each test so patches
+        from one test don't leak into others."""
+        import mem0.graphs.utils as utils_module
+        original = utils_module.EXTRACT_RELATIONS_PROMPT
+        try:
+            yield
+        finally:
+            utils_module.EXTRACT_RELATIONS_PROMPT = original
+            for mod_path in (
+                "mem0.memory.graph_memory",
+                "mem0.memory.memgraph_memory",
+                "mem0.memory.kuzu_memory",
+                "mem0.memory.apache_age_memory",
+            ):
+                try:
+                    import importlib
+                    mod = importlib.import_module(mod_path)
+                    if hasattr(mod, "EXTRACT_RELATIONS_PROMPT"):
+                        mod.EXTRACT_RELATIONS_PROMPT = original
+                except (ImportError, AttributeError):
+                    pass
+
+    def test_appends_augmentation_to_source(self, monkeypatch):
+        monkeypatch.delenv("MEM0_GRAPH_PROMPT_AUGMENT", raising=False)
+        import mem0.graphs.utils as utils_module
+        sentinel = "Additional extraction rules — read carefully:"
+        assert sentinel not in utils_module.EXTRACT_RELATIONS_PROMPT
+        patch_extract_relations_prompt()
+        assert sentinel in utils_module.EXTRACT_RELATIONS_PROMPT
+
+    def test_propagates_to_graph_memory_module(self, monkeypatch):
+        """The bound reference in graph_memory must also be updated, since
+        `from ... import` creates local bindings."""
+        monkeypatch.delenv("MEM0_GRAPH_PROMPT_AUGMENT", raising=False)
+        import mem0.memory.graph_memory as gm
+        sentinel = "Compound technical identifiers are ONE entity"
+        assert sentinel not in gm.EXTRACT_RELATIONS_PROMPT
+        patch_extract_relations_prompt()
+        assert sentinel in gm.EXTRACT_RELATIONS_PROMPT
+
+    def test_idempotent_on_second_call(self, monkeypatch):
+        """Calling twice must not double-append."""
+        monkeypatch.delenv("MEM0_GRAPH_PROMPT_AUGMENT", raising=False)
+        import mem0.graphs.utils as utils_module
+        patch_extract_relations_prompt()
+        once = utils_module.EXTRACT_RELATIONS_PROMPT
+        patch_extract_relations_prompt()
+        twice = utils_module.EXTRACT_RELATIONS_PROMPT
+        assert once == twice
+
+    def test_opt_out_via_env(self, monkeypatch):
+        """MEM0_GRAPH_PROMPT_AUGMENT=false skips the patch entirely."""
+        monkeypatch.setenv("MEM0_GRAPH_PROMPT_AUGMENT", "false")
+        import mem0.graphs.utils as utils_module
+        before = utils_module.EXTRACT_RELATIONS_PROMPT
+        patch_extract_relations_prompt()
+        assert utils_module.EXTRACT_RELATIONS_PROMPT == before

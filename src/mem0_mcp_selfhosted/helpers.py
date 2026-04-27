@@ -95,6 +95,98 @@ def patch_graph_sanitizer() -> None:
     logger.info("Patched mem0ai relationship sanitizer for Neo4j compliance")
 
 
+# Augmentation rules appended to mem0ai's EXTRACT_RELATIONS_PROMPT to fix
+# four failure modes measured against gemma4:e2b and gpt-5.4-nano-tier models
+# in benchmarks/failure_modes_local.py:
+#   F1 (compound entities): 0% → 100%
+#   F2 (org→thing edges): 33% → 67-100% (model-dependent)
+#   F3 (person→person via artifact): 50% → 75-100%
+#   F4 (sub-unit distinct): already 100%
+_AUGMENT_RULES = """
+
+Additional extraction rules — read carefully:
+
+A. Compound technical identifiers are ONE entity, never two:
+   - "AWS us-east-1" → entity "aws us-east-1" (NOT "aws" + "us-east-1")
+   - "GCP europe-west4" → entity "gcp europe-west4"
+   - Cloud regions, fully-qualified service names, version numbers, model
+     IDs, and dotted/dashed identifiers must stay intact as one node.
+
+B. When a person performs an action on or with another person via an
+   intermediary (artifact, team, group, project), create a DIRECT
+   person-to-person edge in addition to any artifact-related edges:
+   - "Maya's team handed off the bridge to David's group"
+     → also emit (maya, handed_off_to, david)
+   - "Sarah transferred the service to Tom"
+     → emit (sarah, transferred_to, tom) directly
+   The direct interpersonal edge is what queries about responsibility
+   transfer will look for.
+
+C. When an organization owns, runs, or hosts a platform/service/product,
+   emit a DIRECT edge from the organization to the platform — not only
+   via a person:
+   - "Maya leads the Helios team at Northwind" → also emit
+     (helios, owned_by, northwind) — the org→platform link is load-bearing.
+   - "Stripe's checkout service" → emit (stripe, owns, checkout_service)
+     with that exact direction (org → service, not service → org).
+
+D. Sub-teams and organizational units (e.g. "Helios platform team",
+   "infrastructure squad") are distinct entities from their parent.
+   Both should appear as nodes, with an edge connecting them.
+
+E. Never emit self-referential edges (source equal to destination).
+   "X --[leads]--> X" is always wrong — drop the relation.
+
+F. Direction matters. "A is head of B" means (a, head_of, b), not
+   (b, head_of, a). "X reports to Y" means (x, reports_to, y).
+"""
+
+
+def patch_extract_relations_prompt() -> None:
+    """Append augmentation rules to mem0ai's EXTRACT_RELATIONS_PROMPT.
+
+    Opt-out via MEM0_GRAPH_PROMPT_AUGMENT=false (default: on). Safe to call
+    multiple times — the augmentation is idempotent (sentinel-checked).
+
+    Patches both the source module and all four importer modules
+    (graph_memory, memgraph_memory, kuzu_memory, apache_age_memory) since
+    `from ... import EXTRACT_RELATIONS_PROMPT` creates local bindings.
+
+    Must be called AFTER mem0 modules are imported but BEFORE
+    Memory.from_config().
+    """
+    if env("MEM0_GRAPH_PROMPT_AUGMENT", "true").lower() in ("false", "0", "no"):
+        logger.info("Skipping EXTRACT_RELATIONS_PROMPT augmentation (opt-out)")
+        return
+
+    import mem0.graphs.utils as utils_module
+
+    sentinel = "Additional extraction rules — read carefully:"
+    if sentinel in utils_module.EXTRACT_RELATIONS_PROMPT:
+        return  # Already patched (idempotent on re-imports)
+
+    augmented = utils_module.EXTRACT_RELATIONS_PROMPT + _AUGMENT_RULES
+    utils_module.EXTRACT_RELATIONS_PROMPT = augmented
+
+    # Patch already-imported references in each graph backend module
+    for mod_path in (
+        "mem0.memory.graph_memory",
+        "mem0.memory.memgraph_memory",
+        "mem0.memory.kuzu_memory",
+        "mem0.memory.apache_age_memory",
+    ):
+        try:
+            import importlib
+
+            mod = importlib.import_module(mod_path)
+            if hasattr(mod, "EXTRACT_RELATIONS_PROMPT"):
+                mod.EXTRACT_RELATIONS_PROMPT = augmented
+        except (ImportError, AttributeError):
+            pass
+
+    logger.info("Patched mem0ai EXTRACT_RELATIONS_PROMPT with failure-mode augmentation")
+
+
 def patch_gemini_parse_response() -> None:
     """Monkey-patch mem0ai's GeminiLLM to guard against null content responses.
 

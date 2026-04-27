@@ -40,3 +40,25 @@ Self-hosted MCP server using `mem0ai` as a library. 11 tools (9 memory + 2 graph
 - `Memory.update()` uses `data=` parameter, not `text=`
 - Structured output support requires claude-opus-4/sonnet-4/haiku-4 models; older models fall back to JSON extraction
 - mem0ai's `sanitize_relationship_for_cypher()` has gaps (no hyphen handling, no leading-digit check) — `patch_graph_sanitizer()` wraps it at startup to ensure all relationship types match `^[a-zA-Z_][a-zA-Z0-9_]*$`
+- `patch_extract_relations_prompt()` appends failure-mode rules (compound-entity preservation, direct org→thing edges, direct person→person via artifact, no self-loops, direction discipline) to mem0ai's `EXTRACT_RELATIONS_PROMPT`. Opt out with `MEM0_GRAPH_PROMPT_AUGMENT=false`. Patches both `mem0.graphs.utils` and the four importer modules (`graph_memory`, `memgraph_memory`, `kuzu_memory`, `apache_age_memory`).
+- `delete_memory` (single) and `delete_all_memories` (bulk) accept `enable_graph` and route through `call_with_graph()` — required because `Memory.delete()` only cleans Neo4j when `self.enable_graph` is True at call time, and that's mutable instance state shared across threads.
+
+## Post-restart MCP smoke test
+
+After restarting Claude Code (which respawns the mem0 MCP with the latest `~/.claude.json` env), run these against the live MCP from any session. Each step has an expected outcome; deviations point to a specific subsystem.
+
+### 1. Tool naming
+Verify the tool list contains `find_entity` and `get_entity`. The pre-rename names `mcp_search_graph` and `mcp_get_entity` must be absent. (If they're still there, MCP did not restart — fully quit Claude Code.)
+
+### 2. New LLM + augmented prompt (one combined check)
+Call `add_memory` with text `"SmokeTest: TestService runs on AWS us-east-1. Maya leads TestService at TestCorp."`, `run_id="smoke-test"`, `enable_graph=true`. Then call `find_entity("aws")`. Expect:
+- A node literally named `aws us-east-1` (proves compound-entity preservation rule fires AND the new LLM is in use — the old gemma4:e2b would have split this into `aws` + `us east 1`).
+- An edge along the lines of `testservice --[owned_by]--> testcorp` (proves the org→thing rule).
+
+If `aws` and `us east 1` come back as separate nodes: augmented prompt didn't fire. Check `MEM0_GRAPH_PROMPT_AUGMENT` is not set to `false` in `~/.claude.json` and restart again.
+
+### 3. delete_memory cleans graph (regression check for the race-fix)
+Take the `memory_id` returned by step 2 and call `delete_memory(memory_id=..., enable_graph=true)`. Then `find_entity("testservice")`. Expect empty `entities` — the per-memory cascade should remove both the vector entry and the graph nodes that came from this memory's text.
+
+### 4. Cleanup
+`delete_all_memories(run_id="smoke-test", enable_graph=true)`. Then `list_entities` should no longer show `smoke-test` under `runs`. If any nodes linger in Neo4j, run a direct cypher: `MATCH (n {run_id: 'smoke-test'}) DETACH DELETE n`.

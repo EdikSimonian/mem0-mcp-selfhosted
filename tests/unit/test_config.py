@@ -251,15 +251,46 @@ class TestBuildConfig:
     def test_unsupported_llm_provider_raises(self):
         """Unsupported MEM0_LLM_PROVIDER raises ValueError."""
         leak_keys = [k for k in os.environ if k.startswith("MEM0_")]
-        env = {"MEM0_LLM_PROVIDER": "gemini"}
+        env = {"MEM0_LLM_PROVIDER": "cohere"}
         with patch.dict("os.environ", env, clear=False) as patched_env:
             for k in leak_keys:
                 if k not in env:
                     patched_env.pop(k, None)
             with patch("mem0_mcp_selfhosted.config.resolve_token", return_value="sk-test"):
                 from mem0_mcp_selfhosted.config import build_config
-                with pytest.raises(ValueError, match="Unsupported MEM0_LLM_PROVIDER='gemini'"):
+                with pytest.raises(ValueError, match="Unsupported MEM0_LLM_PROVIDER='cohere'"):
                     build_config()
+
+    def test_openai_llm_provider(self):
+        """MEM0_LLM_PROVIDER=openai sets the LLM provider to openai (LiteLLM-compatible)."""
+        env = {"MEM0_LLM_PROVIDER": "openai", "OPENAI_API_KEY": "sk-test"}
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["llm"]["provider"] == "openai"
+        assert config_dict["llm"]["config"]["model"] == "gpt-5.4-nano"
+        assert config_dict["llm"]["config"]["api_key"] == "sk-test"
+
+    def test_openai_llm_url_sets_base_url(self):
+        """MEM0_LLM_URL becomes openai_base_url for LiteLLM/gateway routing."""
+        env = {
+            "MEM0_LLM_PROVIDER": "openai",
+            "MEM0_LLM_URL": "https://litellm.example.com/v1",
+            "OPENAI_API_KEY": "sk-test",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["llm"]["config"]["openai_base_url"] == "https://litellm.example.com/v1"
+
+    def test_openai_graph_llm_inherits_base_url(self):
+        """Graph LLM under openai provider reuses MEM0_LLM_URL when MEM0_GRAPH_LLM_URL unset."""
+        env = {
+            "MEM0_PROVIDER": "openai",
+            "MEM0_LLM_URL": "https://litellm.example.com/v1",
+            "OPENAI_API_KEY": "sk-test",
+            "MEM0_ENABLE_GRAPH": "true",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        graph_cfg = config_dict["graph_store"]["llm"]["config"]
+        assert graph_cfg["openai_base_url"] == "https://litellm.example.com/v1"
+        assert graph_cfg["api_key"] == "sk-test"
 
     def test_anthropic_config_has_api_key_and_max_tokens(self):
         """Anthropic LLM config includes api_key and max_tokens."""

@@ -1,0 +1,48 @@
+name: memory
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: memory-qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_REST_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - ${MEM0_DATA_DIR:?MEM0_DATA_DIR must be set in .env (absolute path, e.g. /Users/you/.mem0-stack)}/qdrant/storage:/qdrant/storage
+      - ${MEM0_DATA_DIR}/qdrant/snapshots:/qdrant/snapshots
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: memory-neo4j
+    restart: unless-stopped
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-mem0graph}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*"
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-512m}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-2G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
+    volumes:
+      - ${MEM0_DATA_DIR}/neo4j/data:/data
+      - ${MEM0_DATA_DIR}/neo4j/logs:/logs
+      - ${MEM0_DATA_DIR}/neo4j/import:/var/lib/neo4j/import
+      - ${MEM0_DATA_DIR}/neo4j/plugins:/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u $${NEO4J_USER:-neo4j} -p $$(echo $$NEO4J_AUTH | cut -d/ -f2) 'RETURN 1' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s

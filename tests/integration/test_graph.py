@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from mem0_mcp_selfhosted.graph_tools import search_graph
+from mem0_mcp_selfhosted.graph_tools import find_entity
 from mem0_mcp_selfhosted.helpers import call_with_graph
 
 pytestmark = pytest.mark.integration
@@ -109,7 +109,7 @@ class TestGraphOperations:
             else:
                 os.environ.pop("MEM0_ENABLE_GRAPH", None)
 
-    def test_search_graph_finds_entity(
+    def test_find_entity_finds_entity(
         self, memory_instance, neo4j_available, test_user_id
     ):
         """Add an entity-rich memory with graph, then search Neo4j for it."""
@@ -131,7 +131,7 @@ class TestGraphOperations:
                 user_id=test_user_id,
             )
 
-            result_str = search_graph("GraphTestUser")
+            result_str = find_entity("GraphTestUser")
             result = json.loads(result_str)
 
             assert "error" not in result
