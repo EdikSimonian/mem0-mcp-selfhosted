@@ -16,7 +16,7 @@ import re
 import threading
 from typing import Any, Callable
 
-from mem0_mcp_selfhosted.env import env
+from mem0_mcp_selfhosted.env import bool_env, env
 
 logger = logging.getLogger(__name__)
 
@@ -550,8 +550,17 @@ def gc_orphan_graph_nodes(
     FOREACH (x IN orphans | DETACH DELETE x)
     RETURN cnt AS deleted
     """
+    gc_debug = bool_env("MEM0_GC_DEBUG")
     try:
+        if gc_debug:
+            with open("/tmp/gc-debug.log", "a") as _dbg:
+                _dbg.write(
+                    f"[gc] enter filters={filters} node_label={node_label!r} cypher_params={params}\n"
+                )
         rows = graph.graph.query(cypher, params=params)
+        if gc_debug:
+            with open("/tmp/gc-debug.log", "a") as _dbg:
+                _dbg.write(f"[gc] rows={rows!r}\n")
         deleted = (rows[0].get("deleted") if rows else 0) or 0
         if deleted:
             logger.info(
@@ -561,6 +570,9 @@ def gc_orphan_graph_nodes(
             )
         return deleted
     except Exception as exc:
+        if gc_debug:
+            with open("/tmp/gc-debug.log", "a") as _dbg:
+                _dbg.write(f"[gc] EXCEPTION {type(exc).__name__}: {exc}\n")
         logger.warning("Orphan node GC failed for filters %s: %s", filters, exc)
         return 0
 

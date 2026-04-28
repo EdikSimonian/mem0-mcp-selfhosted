@@ -27,6 +27,7 @@ from mem0_mcp_selfhosted.graph_tools import (
 from mem0_mcp_selfhosted.helpers import (
     _mem0_call,
     call_with_graph,
+    gc_orphan_graph_nodes,
     get_default_user_id,
     list_entities_facet,
     patch_extract_relations_prompt,
@@ -440,7 +441,21 @@ def _register_tools(mcp: FastMCP) -> None:
                         exc,
                     )
 
+            gc_debug = bool_env("MEM0_GC_DEBUG")
+
+            if gc_debug:
+                with open("/tmp/gc-debug.log", "a") as _dbg:
+                    _dbg.write(
+                        f"[do_delete] memory_id={memory_id} graph_enabled={graph_enabled} scope={scope}\n"
+                    )
+
             mem.delete(memory_id)
+
+            if gc_debug:
+                with open("/tmp/gc-debug.log", "a") as _dbg:
+                    _dbg.write(
+                        f"[do_delete] mem.delete returned; will_call_gc={graph_enabled and bool(scope.get('user_id'))}\n"
+                    )
 
             if graph_enabled and scope.get("user_id"):
                 gc_orphan_graph_nodes(mem, scope)
