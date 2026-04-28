@@ -30,7 +30,9 @@ from mem0_mcp_selfhosted.helpers import (
     get_default_user_id,
     list_entities_facet,
     patch_extract_relations_prompt,
+    patch_fact_retrieval_prompt,
     patch_gemini_parse_response,
+    patch_graph_entity_extraction,
     patch_graph_sanitizer,
     safe_bulk_delete,
 )
@@ -98,10 +100,12 @@ def _init_memory() -> Any:
 
     register_providers(providers_info)
 
-    # Patch mem0ai's relationship sanitizer + extraction prompt before Memory init
+    # Patch mem0ai's relationship sanitizer + extraction prompts before Memory init
     patch_graph_sanitizer()
     patch_gemini_parse_response()
     patch_extract_relations_prompt()
+    patch_graph_entity_extraction()
+    patch_fact_retrieval_prompt()
 
     # Initialize Memory
     from mem0 import Memory
@@ -110,7 +114,10 @@ def _init_memory() -> Any:
 
     # If split-model was requested, swap the graph LLM with the router
     if split_config and memory.graph is not None:
-        from mem0_mcp_selfhosted.llm_router import SplitModelGraphLLM, SplitModelGraphLLMConfig
+        from mem0_mcp_selfhosted.llm_router import (
+            SplitModelGraphLLM,
+            SplitModelGraphLLMConfig,
+        )
 
         router_config = SplitModelGraphLLMConfig(**split_config)
         memory.graph.llm = SplitModelGraphLLM(router_config)
@@ -190,14 +197,42 @@ def _register_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def add_memory(
-        text: Annotated[str, Field(description="Text to store as a memory. Converted to messages format internally.")],
-        messages: Annotated[list[dict] | None, Field(description="Structured conversation history (role/content dicts). When provided, takes precedence over text.")] = None,
-        user_id: Annotated[str | None, Field(description="User scope identifier. Defaults to MEM0_USER_ID.")] = None,
-        agent_id: Annotated[str | None, Field(description="Agent scope identifier.")] = None,
-        run_id: Annotated[str | None, Field(description="Run scope identifier.")] = None,
-        metadata: Annotated[dict | None, Field(description="Arbitrary metadata JSON to store alongside the memory.")] = None,
-        infer: Annotated[bool | None, Field(description="If true (default), LLM extracts key facts. If false, stores raw text.")] = None,
-        enable_graph: Annotated[bool | None, Field(description="Override default graph toggle for this call.")] = None,
+        text: Annotated[
+            str,
+            Field(
+                description="Text to store as a memory. Converted to messages format internally."
+            ),
+        ],
+        messages: Annotated[
+            list[dict] | None,
+            Field(
+                description="Structured conversation history (role/content dicts). When provided, takes precedence over text."
+            ),
+        ] = None,
+        user_id: Annotated[
+            str | None,
+            Field(description="User scope identifier. Defaults to MEM0_USER_ID."),
+        ] = None,
+        agent_id: Annotated[
+            str | None, Field(description="Agent scope identifier.")
+        ] = None,
+        run_id: Annotated[
+            str | None, Field(description="Run scope identifier.")
+        ] = None,
+        metadata: Annotated[
+            dict | None,
+            Field(description="Arbitrary metadata JSON to store alongside the memory."),
+        ] = None,
+        infer: Annotated[
+            bool | None,
+            Field(
+                description="If true (default), LLM extracts key facts. If false, stores raw text."
+            ),
+        ] = None,
+        enable_graph: Annotated[
+            bool | None,
+            Field(description="Override default graph toggle for this call."),
+        ] = None,
     ) -> str:
         """Store a new memory. Requires at least one of user_id, agent_id, or run_id."""
         uid = user_id or get_default_user_id()
@@ -223,19 +258,35 @@ def _register_tools(mcp: FastMCP) -> None:
         def _do_add():
             return mem.add(msgs, **kwargs)
 
-        return _mem0_call(call_with_graph, mem, enable_graph, _enable_graph_default, _do_add)
+        return _mem0_call(
+            call_with_graph, mem, enable_graph, _enable_graph_default, _do_add
+        )
 
     @mcp.tool()
     def search_memories(
-        query: Annotated[str, Field(description="Natural language description of what to find.")],
-        user_id: Annotated[str | None, Field(description="User scope. Defaults to MEM0_USER_ID.")] = None,
+        query: Annotated[
+            str, Field(description="Natural language description of what to find.")
+        ],
+        user_id: Annotated[
+            str | None, Field(description="User scope. Defaults to MEM0_USER_ID.")
+        ] = None,
         agent_id: Annotated[str | None, Field(description="Agent scope.")] = None,
         run_id: Annotated[str | None, Field(description="Run scope.")] = None,
-        filters: Annotated[dict | None, Field(description="Additional structured filter clauses.")] = None,
-        limit: Annotated[int | None, Field(description="Maximum number of results.")] = None,
-        threshold: Annotated[float | None, Field(description="Minimum relevance score (0.0-1.0).")] = None,
-        rerank: Annotated[bool | None, Field(description="Whether to apply reranking.")] = None,
-        enable_graph: Annotated[bool | None, Field(description="Override default graph toggle.")] = None,
+        filters: Annotated[
+            dict | None, Field(description="Additional structured filter clauses.")
+        ] = None,
+        limit: Annotated[
+            int | None, Field(description="Maximum number of results.")
+        ] = None,
+        threshold: Annotated[
+            float | None, Field(description="Minimum relevance score (0.0-1.0).")
+        ] = None,
+        rerank: Annotated[
+            bool | None, Field(description="Whether to apply reranking.")
+        ] = None,
+        enable_graph: Annotated[
+            bool | None, Field(description="Override default graph toggle.")
+        ] = None,
     ) -> str:
         """Semantic search across existing memories."""
         uid = user_id or get_default_user_id()
@@ -261,14 +312,20 @@ def _register_tools(mcp: FastMCP) -> None:
         def _do_search():
             return mem.search(**kwargs)
 
-        return _mem0_call(call_with_graph, mem, enable_graph, _enable_graph_default, _do_search)
+        return _mem0_call(
+            call_with_graph, mem, enable_graph, _enable_graph_default, _do_search
+        )
 
     @mcp.tool()
     def get_memories(
-        user_id: Annotated[str | None, Field(description="User scope. Defaults to MEM0_USER_ID.")] = None,
+        user_id: Annotated[
+            str | None, Field(description="User scope. Defaults to MEM0_USER_ID.")
+        ] = None,
         agent_id: Annotated[str | None, Field(description="Agent scope.")] = None,
         run_id: Annotated[str | None, Field(description="Run scope.")] = None,
-        limit: Annotated[int | None, Field(description="Maximum number of memories to return.")] = None,
+        limit: Annotated[
+            int | None, Field(description="Maximum number of memories to return.")
+        ] = None,
     ) -> str:
         """Page through memories using filters instead of search."""
         uid = user_id or get_default_user_id()
@@ -285,7 +342,13 @@ def _register_tools(mcp: FastMCP) -> None:
 
         mem = _ensure_memory()
         if mem is None:
-            return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "error": "Memory not initialized",
+                    "detail": "Infrastructure may be unavailable.",
+                },
+                ensure_ascii=False,
+            )
         return _mem0_call(mem.get_all, **kwargs)
 
     @mcp.tool()
@@ -295,7 +358,13 @@ def _register_tools(mcp: FastMCP) -> None:
         """Fetch a single memory by its ID."""
         mem = _ensure_memory()
         if mem is None:
-            return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "error": "Memory not initialized",
+                    "detail": "Infrastructure may be unavailable.",
+                },
+                ensure_ascii=False,
+            )
         return _mem0_call(mem.get, memory_id)
 
     @mcp.tool()
@@ -306,7 +375,13 @@ def _register_tools(mcp: FastMCP) -> None:
         """Overwrite an existing memory's text. Re-embeds and re-indexes."""
         mem = _ensure_memory()
         if mem is None:
-            return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "error": "Memory not initialized",
+                    "detail": "Infrastructure may be unavailable.",
+                },
+                ensure_ascii=False,
+            )
 
         def _do_update():
             mem.update(memory_id, data=text)
@@ -317,7 +392,12 @@ def _register_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def delete_memory(
         memory_id: Annotated[str, Field(description="Exact memory UUID to delete.")],
-        enable_graph: Annotated[bool | None, Field(description="Override default graph toggle. When true, also cleans up graph entities extracted from this memory's text.")] = None,
+        enable_graph: Annotated[
+            bool | None,
+            Field(
+                description="Override default graph toggle. When true, also cleans up graph entities extracted from this memory's text."
+            ),
+        ] = None,
     ) -> str:
         """Delete a single memory.
 
@@ -328,20 +408,64 @@ def _register_tools(mcp: FastMCP) -> None:
         """
         mem = _ensure_memory()
         if mem is None:
-            return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "error": "Memory not initialized",
+                    "detail": "Infrastructure may be unavailable.",
+                },
+                ensure_ascii=False,
+            )
+
+        graph_enabled = (
+            enable_graph if enable_graph is not None else _enable_graph_default
+        )
 
         def _do_delete():
+            # Capture the memory's scope before delete so the orphan GC
+            # can run a same-scope DETACH DELETE pass after mem0ai's
+            # cascade soft-deletes incident edges.
+            scope: dict[str, Any] = {}
+            if graph_enabled and mem.graph is not None:
+                try:
+                    existing = mem.vector_store.get(vector_id=memory_id)
+                    payload = getattr(existing, "payload", None) or {}
+                    for key in ("user_id", "agent_id", "run_id"):
+                        val = payload.get(key)
+                        if val:
+                            scope[key] = val
+                except Exception as exc:
+                    logger.warning(
+                        "Could not read scope for memory %s before delete: %s",
+                        memory_id,
+                        exc,
+                    )
+
             mem.delete(memory_id)
+
+            if graph_enabled and scope.get("user_id"):
+                gc_orphan_graph_nodes(mem, scope)
+
             return {"message": "Memory deleted successfully!"}
 
-        return _mem0_call(call_with_graph, mem, enable_graph, _enable_graph_default, _do_delete)
+        return _mem0_call(
+            call_with_graph, mem, enable_graph, _enable_graph_default, _do_delete
+        )
 
     @mcp.tool()
     def delete_all_memories(
-        user_id: Annotated[str | None, Field(description="User scope to delete.")] = None,
-        agent_id: Annotated[str | None, Field(description="Agent scope to delete.")] = None,
+        user_id: Annotated[
+            str | None, Field(description="User scope to delete.")
+        ] = None,
+        agent_id: Annotated[
+            str | None, Field(description="Agent scope to delete.")
+        ] = None,
         run_id: Annotated[str | None, Field(description="Run scope to delete.")] = None,
-        enable_graph: Annotated[bool | None, Field(description="Override default graph toggle. When true, also calls graph.delete_all(filters) to clean Neo4j.")] = None,
+        enable_graph: Annotated[
+            bool | None,
+            Field(
+                description="Override default graph toggle. When true, also calls graph.delete_all(filters) to clean Neo4j."
+            ),
+        ] = None,
     ) -> str:
         """Bulk-delete all memories in the given scope. Requires at least one filter.
 
@@ -350,7 +474,9 @@ def _register_tools(mcp: FastMCP) -> None:
         uid = user_id or get_default_user_id()
         if not any([uid, agent_id, run_id]):
             return json.dumps(
-                {"error": "At least one scope (user_id, agent_id, or run_id) is required."},
+                {
+                    "error": "At least one scope (user_id, agent_id, or run_id) is required."
+                },
                 ensure_ascii=False,
             )
 
@@ -364,9 +490,17 @@ def _register_tools(mcp: FastMCP) -> None:
 
         mem = _ensure_memory()
         if mem is None:
-            return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "error": "Memory not initialized",
+                    "detail": "Infrastructure may be unavailable.",
+                },
+                ensure_ascii=False,
+            )
 
-        graph_enabled = enable_graph if enable_graph is not None else _enable_graph_default
+        graph_enabled = (
+            enable_graph if enable_graph is not None else _enable_graph_default
+        )
 
         def _do_bulk_delete():
             count = safe_bulk_delete(mem, filters, graph_enabled=graph_enabled)
@@ -387,7 +521,13 @@ def _register_tools(mcp: FastMCP) -> None:
         """
         mem = _ensure_memory()
         if mem is None:
-            return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "error": "Memory not initialized",
+                    "detail": "Infrastructure may be unavailable.",
+                },
+                ensure_ascii=False,
+            )
 
         def _do_list():
             return list_entities_facet(mem)
@@ -396,9 +536,16 @@ def _register_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def delete_entities(
-        user_id: Annotated[str | None, Field(description="User entity to delete (cascades to all memories).")] = None,
-        agent_id: Annotated[str | None, Field(description="Agent entity to delete.")] = None,
-        run_id: Annotated[str | None, Field(description="Run entity to delete.")] = None,
+        user_id: Annotated[
+            str | None,
+            Field(description="User entity to delete (cascades to all memories)."),
+        ] = None,
+        agent_id: Annotated[
+            str | None, Field(description="Agent entity to delete.")
+        ] = None,
+        run_id: Annotated[
+            str | None, Field(description="Run entity to delete.")
+        ] = None,
     ) -> str:
         """Delete an entity and cascade-delete all its memories.
 
@@ -406,7 +553,9 @@ def _register_tools(mcp: FastMCP) -> None:
         """
         if not any([user_id, agent_id, run_id]):
             return json.dumps(
-                {"error": "At least one scope (user_id, agent_id, or run_id) is required."},
+                {
+                    "error": "At least one scope (user_id, agent_id, or run_id) is required."
+                },
                 ensure_ascii=False,
             )
 
@@ -420,11 +569,20 @@ def _register_tools(mcp: FastMCP) -> None:
 
         mem = _ensure_memory()
         if mem is None:
-            return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "error": "Memory not initialized",
+                    "detail": "Infrastructure may be unavailable.",
+                },
+                ensure_ascii=False,
+            )
 
         def _do_delete_entity():
             count = safe_bulk_delete(mem, filters, graph_enabled=_enable_graph_default)
-            return {"message": f"Entity deleted. Removed {count} memories.", "count": count}
+            return {
+                "message": f"Entity deleted. Removed {count} memories.",
+                "count": count,
+            }
 
         return _mem0_call(_do_delete_entity)
 
@@ -434,7 +592,12 @@ def _register_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def find_entity(
-        query: Annotated[str, Field(description="Substring of an entity name, case-insensitive (e.g. 'helios', 'kuber'). Use '*' or '' to list up to 100 entities. NOT a natural-language query.")],
+        query: Annotated[
+            str,
+            Field(
+                description="Substring of an entity name, case-insensitive (e.g. 'helios', 'kuber'). Use '*' or '' to list up to 100 entities. NOT a natural-language query."
+            ),
+        ],
     ) -> str:
         """Find graph entities by case-insensitive name substring (up to 25 matches with outgoing edges).
 
@@ -446,7 +609,12 @@ def _register_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def get_entity(
-        name: Annotated[str, Field(description="Exact entity name to look up (case-insensitive equality, no substring).")],
+        name: Annotated[
+            str,
+            Field(
+                description="Exact entity name to look up (case-insensitive equality, no substring)."
+            ),
+        ],
     ) -> str:
         """Get the full bidirectional relationship profile for one entity (incoming + outgoing edges)."""
         return _get_entity_impl(name)
@@ -476,7 +644,7 @@ def _register_prompts(mcp: FastMCP) -> None:
             "- Set enable_graph=true to include knowledge graph results\n"
             "- Use infer=false to store raw text without LLM extraction\n"
             "- Use threshold on search_memories to filter by relevance score\n"
-            "- Use filters for structured queries: {\"key\": {\"eq\": \"value\"}}\n"
+            '- Use filters for structured queries: {"key": {"eq": "value"}}\n'
         )
 
 

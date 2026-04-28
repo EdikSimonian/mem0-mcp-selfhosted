@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +11,7 @@ from mem0_mcp_selfhosted.helpers import (
     _make_enhanced_sanitizer,
     _mem0_call,
     call_with_graph,
+    gc_orphan_graph_nodes,
     get_default_user_id,
     patch_extract_relations_prompt,
     patch_gemini_parse_response,
@@ -27,6 +27,7 @@ class TestMem0Call:
 
     def test_memory_error_caught(self):
         """MemoryError subclass returns structured error JSON."""
+
         # Create a mock MemoryError-like exception
         class FakeMemoryError(Exception):
             pass
@@ -48,6 +49,7 @@ class TestMem0Call:
 
     def test_generic_exception_caught(self):
         """Generic Exception returns type name and detail."""
+
         def _raise():
             raise ValueError("bad input")
 
@@ -163,6 +165,91 @@ class TestSafeBulkDelete:
         memory.graph.delete_all.assert_not_called()
 
 
+class TestGcOrphanGraphNodes:
+    def _build_memory(self, node_label: str = "", deleted: int = 0):
+        """MagicMock memory whose graph.graph.query returns deleted-count rows."""
+        memory = MagicMock()
+        memory.graph = MagicMock()
+        memory.graph.node_label = node_label
+        memory.graph.graph.query.return_value = [{"deleted": deleted}]
+        return memory
+
+    def test_returns_zero_when_graph_unavailable(self):
+        memory = MagicMock()
+        memory.graph = None
+        assert gc_orphan_graph_nodes(memory, {"user_id": "u1"}) == 0
+
+    def test_returns_zero_without_user_id(self):
+        memory = self._build_memory()
+        # No user_id in filters → must not run query (avoids unbounded scan).
+        assert gc_orphan_graph_nodes(memory, {"agent_id": "a1"}) == 0
+        memory.graph.graph.query.assert_not_called()
+
+    def test_basic_user_scope_query_and_count(self):
+        memory = self._build_memory(deleted=2)
+        deleted = gc_orphan_graph_nodes(memory, {"user_id": "eddie"})
+        assert deleted == 2
+        call = memory.graph.graph.query.call_args
+        cypher = call.args[0]
+        params = call.kwargs["params"]
+        assert params == {"user_id": "eddie", "recency": 30}
+        assert "n.user_id = $user_id" in cypher
+        assert "DETACH DELETE x" in cypher
+        # No agent/run scope when filters omit them
+        assert "$agent_id" not in cypher
+        assert "$run_id" not in cypher
+
+    def test_agent_and_run_scope_propagated(self):
+        memory = self._build_memory(deleted=0)
+        gc_orphan_graph_nodes(
+            memory,
+            {"user_id": "eddie", "agent_id": "agentX", "run_id": "smoke-test"},
+            recency_seconds=10,
+        )
+        call = memory.graph.graph.query.call_args
+        cypher = call[0][0]
+        params = call.kwargs["params"]
+        assert params == {
+            "user_id": "eddie",
+            "agent_id": "agentX",
+            "run_id": "smoke-test",
+            "recency": 10,
+        }
+        assert "n.agent_id = $agent_id" in cypher
+        assert "n.run_id = $run_id" in cypher
+
+    def test_node_label_injected(self):
+        memory = self._build_memory(node_label=":`__Entity__`", deleted=0)
+        gc_orphan_graph_nodes(memory, {"user_id": "eddie"})
+        cypher = memory.graph.graph.query.call_args[0][0]
+        assert ":`__Entity__`" in cypher
+
+    def test_recency_check_uses_invalidated_at(self):
+        memory = self._build_memory(deleted=0)
+        gc_orphan_graph_nodes(memory, {"user_id": "eddie"})
+        cypher = memory.graph.graph.query.call_args[0][0]
+        # Both legs of the WHERE: orphan-check (no valid edges)
+        # AND recency-check (at least one edge invalidated within window).
+        assert "r.valid IS NULL OR r.valid = true" in cypher
+        assert "r2.valid = false" in cypher
+        assert "r2.invalidated_at >= datetime() - duration" in cypher
+
+    def test_query_failure_swallowed_returns_zero(self):
+        memory = self._build_memory()
+        memory.graph.graph.query.side_effect = RuntimeError("neo4j down")
+        assert gc_orphan_graph_nodes(memory, {"user_id": "eddie"}) == 0
+
+    def test_empty_result_returns_zero(self):
+        memory = self._build_memory()
+        memory.graph.graph.query.return_value = []
+        assert gc_orphan_graph_nodes(memory, {"user_id": "eddie"}) == 0
+
+    def test_null_deleted_count_returns_zero(self):
+        memory = self._build_memory()
+        memory.graph.graph.query.return_value = [{"deleted": None}]
+        assert gc_orphan_graph_nodes(memory, {"user_id": "eddie"}) == 0
+
+
 class TestGetDefaultUserId:
     def test_default(self, monkeypatch):
         monkeypatch.delenv("MEM0_USER_ID", raising=False)
@@ -275,7 +362,9 @@ class TestEnhancedSanitizer:
         ]
         for case in test_cases:
             result = sanitize(case)
-            assert pattern.match(result), f"'{case}' → '{result}' is not a valid Neo4j type"
+            assert pattern.match(result), (
+                f"'{case}' → '{result}' is not a valid Neo4j type"
+            )
 
 
 class TestPatchGeminiParseResponse:
@@ -360,6 +449,7 @@ class TestPatchExtractRelationsPrompt:
         """Save and restore the original prompt around each test so patches
         from one test don't leak into others."""
         import mem0.graphs.utils as utils_module
+
         original = utils_module.EXTRACT_RELATIONS_PROMPT
         try:
             yield
@@ -373,6 +463,7 @@ class TestPatchExtractRelationsPrompt:
             ):
                 try:
                     import importlib
+
                     mod = importlib.import_module(mod_path)
                     if hasattr(mod, "EXTRACT_RELATIONS_PROMPT"):
                         mod.EXTRACT_RELATIONS_PROMPT = original
@@ -382,16 +473,24 @@ class TestPatchExtractRelationsPrompt:
     def test_appends_augmentation_to_source(self, monkeypatch):
         monkeypatch.delenv("MEM0_GRAPH_PROMPT_AUGMENT", raising=False)
         import mem0.graphs.utils as utils_module
-        sentinel = "Additional extraction rules — read carefully:"
+
+        sentinel = "MANDATORY EXTRACTION RULES — apply these BEFORE"
         assert sentinel not in utils_module.EXTRACT_RELATIONS_PROMPT
         patch_extract_relations_prompt()
         assert sentinel in utils_module.EXTRACT_RELATIONS_PROMPT
+        # Rules must precede the upstream prompt body (head, not tail)
+        rules_idx = utils_module.EXTRACT_RELATIONS_PROMPT.index(sentinel)
+        body_idx = utils_module.EXTRACT_RELATIONS_PROMPT.index(
+            "You are an advanced algorithm"
+        )
+        assert rules_idx < body_idx
 
     def test_propagates_to_graph_memory_module(self, monkeypatch):
         """The bound reference in graph_memory must also be updated, since
         `from ... import` creates local bindings."""
         monkeypatch.delenv("MEM0_GRAPH_PROMPT_AUGMENT", raising=False)
         import mem0.memory.graph_memory as gm
+
         sentinel = "Compound technical identifiers are ONE entity"
         assert sentinel not in gm.EXTRACT_RELATIONS_PROMPT
         patch_extract_relations_prompt()
@@ -401,6 +500,7 @@ class TestPatchExtractRelationsPrompt:
         """Calling twice must not double-append."""
         monkeypatch.delenv("MEM0_GRAPH_PROMPT_AUGMENT", raising=False)
         import mem0.graphs.utils as utils_module
+
         patch_extract_relations_prompt()
         once = utils_module.EXTRACT_RELATIONS_PROMPT
         patch_extract_relations_prompt()
@@ -411,6 +511,7 @@ class TestPatchExtractRelationsPrompt:
         """MEM0_GRAPH_PROMPT_AUGMENT=false skips the patch entirely."""
         monkeypatch.setenv("MEM0_GRAPH_PROMPT_AUGMENT", "false")
         import mem0.graphs.utils as utils_module
+
         before = utils_module.EXTRACT_RELATIONS_PROMPT
         patch_extract_relations_prompt()
         assert utils_module.EXTRACT_RELATIONS_PROMPT == before

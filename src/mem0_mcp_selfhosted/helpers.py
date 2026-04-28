@@ -95,24 +95,51 @@ def patch_graph_sanitizer() -> None:
     logger.info("Patched mem0ai relationship sanitizer for Neo4j compliance")
 
 
-# Augmentation rules appended to mem0ai's EXTRACT_RELATIONS_PROMPT to fix
+# Augmentation rules injected into mem0ai's EXTRACT_RELATIONS_PROMPT to fix
 # four failure modes measured against gemma4:e2b and gpt-5.4-nano-tier models
 # in benchmarks/failure_modes_local.py:
 #   F1 (compound entities): 0% → 100%
 #   F2 (org→thing edges): 33% → 67-100% (model-dependent)
 #   F3 (person→person via artifact): 50% → 75-100%
 #   F4 (sub-unit distinct): already 100%
-_AUGMENT_RULES = """
+#
+# Placed at the HEAD of the prompt, not the tail. Haiku-class models'
+# instruction-following decays through long prompts; tail-appended rules
+# were observed to be silently ignored (e.g. self-loop on owned_by despite
+# rule A's literal example).
+_AUGMENT_RULES = """MANDATORY EXTRACTION RULES — apply these BEFORE the standard guidelines below.
 
-Additional extraction rules — read carefully:
+These rules describe HOW you extract. They are NOT facts about the input.
+- Do not emit entities, relations, or labels whose names paraphrase these
+  rules (e.g. "compound entity preservation", "self loop", "preserved by",
+  "self-referential", "mandatory rule"). Only extract things explicitly
+  stated in the input text.
+- Do not emit nodes whose names contain arrow notation, brackets, or
+  triple-encoded relations (e.g. "X→relation→Y", "X --[r]--> Y"). These
+  are notation, not entities.
+- If a rule below says "NEVER emit X", that means produce no triple at
+  all — do not produce a substitute triple that describes the violation.
 
-A. Compound technical identifiers are ONE entity, never two:
+A. NEVER emit self-referential edges (source equal to destination).
+   This is the most common failure mode. If you cannot identify a distinct
+   target, DROP the edge entirely — emit nothing. Do NOT use the source
+   as a placeholder target.
+   - "X --[leads]--> X" is always wrong.
+   - "Maya leads TestService at TestCorp" → emit (testservice, owned_by, testcorp).
+     NEVER (testservice, owned_by, testservice).
+   - If a named target appears in the text but is missing from your entity
+     list, INCLUDE IT in the relation anyway (use the surface form from
+     the text). The entity list is not a closed set — companies, products,
+     and named things mentioned in text are valid targets even if the
+     prior extraction step missed them.
+
+B. Compound technical identifiers are ONE entity, never two:
    - "AWS us-east-1" → entity "aws us-east-1" (NOT "aws" + "us-east-1")
    - "GCP europe-west4" → entity "gcp europe-west4"
    - Cloud regions, fully-qualified service names, version numbers, model
      IDs, and dotted/dashed identifiers must stay intact as one node.
 
-B. When a person performs an action on or with another person via an
+C. When a person performs an action on or with another person via an
    intermediary (artifact, team, group, project), create a DIRECT
    person-to-person edge in addition to any artifact-related edges:
    - "Maya's team handed off the bridge to David's group"
@@ -122,28 +149,44 @@ B. When a person performs an action on or with another person via an
    The direct interpersonal edge is what queries about responsibility
    transfer will look for.
 
-C. When an organization owns, runs, or hosts a platform/service/product,
+D. When an organization owns, runs, or hosts a platform/service/product,
    emit a DIRECT edge from the organization to the platform — not only
-   via a person:
+   via a person. The organization MUST be a distinct entity from the
+   platform; if you can't find a distinct org, drop the edge (rule A).
+   - "Maya leads TestService at TestCorp" → emit (testservice, owned_by, testcorp).
+     The org "testcorp" is the target even if it's not in your input
+     entity list. NEVER substitute (testservice, owned_by, testservice).
    - "Maya leads the Helios team at Northwind" → also emit
      (helios, owned_by, northwind) — the org→platform link is load-bearing.
    - "Stripe's checkout service" → emit (stripe, owns, checkout_service)
      with that exact direction (org → service, not service → org).
 
-D. Sub-teams and organizational units (e.g. "Helios platform team",
+E. Sub-teams and organizational units (e.g. "Helios platform team",
    "infrastructure squad") are distinct entities from their parent.
    Both should appear as nodes, with an edge connecting them.
 
-E. Never emit self-referential edges (source equal to destination).
-   "X --[leads]--> X" is always wrong — drop the relation.
-
 F. Direction matters. "A is head of B" means (a, head_of, b), not
    (b, head_of, a). "X reports to Y" means (x, reports_to, y).
+
+G. Parenthetical clarifications describe — they DO NOT replace the subject.
+   In "X (descriptor mentioning Y) verb Z", the subject is X, never Y.
+   The parenthetical only adds context about X.
+   - "Edmond (Eddie's brother) is married to Karolin"
+     → emit (edmond, married_to, karolin). NEVER (eddie, married_to, karolin).
+   - "Helios (the platform team at Northwind) ships v3"
+     → emit (helios, ships, v3). NEVER (platform_team, ships, v3) and
+       NEVER (northwind, ships, v3) for this verb.
+   - The relation "X (Y's brother) is..." may also yield (x, brother_of, y),
+     but it must not yield (y, brother_of, y) or (y, brother_of, x).
+   When a pronoun "they / their / them" follows such a sentence,
+   "they" refers to X (the subject), not to Y inside the parenthetical.
+
+---
 """
 
 
 def patch_extract_relations_prompt() -> None:
-    """Append augmentation rules to mem0ai's EXTRACT_RELATIONS_PROMPT.
+    """Prepend augmentation rules to mem0ai's EXTRACT_RELATIONS_PROMPT.
 
     Opt-out via MEM0_GRAPH_PROMPT_AUGMENT=false (default: on). Safe to call
     multiple times — the augmentation is idempotent (sentinel-checked).
@@ -161,11 +204,16 @@ def patch_extract_relations_prompt() -> None:
 
     import mem0.graphs.utils as utils_module
 
-    sentinel = "Additional extraction rules — read carefully:"
+    sentinel = "MANDATORY EXTRACTION RULES — apply these BEFORE"
     if sentinel in utils_module.EXTRACT_RELATIONS_PROMPT:
         return  # Already patched (idempotent on re-imports)
 
-    augmented = utils_module.EXTRACT_RELATIONS_PROMPT + _AUGMENT_RULES
+    augmented = (
+        "\n"
+        + _AUGMENT_RULES
+        + "\n"
+        + utils_module.EXTRACT_RELATIONS_PROMPT.lstrip("\n")
+    )
     utils_module.EXTRACT_RELATIONS_PROMPT = augmented
 
     # Patch already-imported references in each graph backend module
@@ -184,7 +232,156 @@ def patch_extract_relations_prompt() -> None:
         except (ImportError, AttributeError):
             pass
 
-    logger.info("Patched mem0ai EXTRACT_RELATIONS_PROMPT with failure-mode augmentation")
+    logger.info(
+        "Patched mem0ai EXTRACT_RELATIONS_PROMPT with failure-mode augmentation"
+    )
+
+
+# Augmentation rules injected into the inline system prompt of
+# GraphMemory._retrieve_nodes_from_data. Without this, delete-time entity
+# re-extraction may split compound identifiers (e.g. "AWS us-east-1" →
+# "aws" + "us-east-1") that add-time extraction kept whole — breaking
+# Memory.delete()'s graph cascade because the resulting triples don't match
+# the stored edges.
+_ENTITY_EXTRACT_AUGMENT = """\
+CRITICAL ENTITY RULES — apply these strictly.
+
+These rules describe HOW you extract. They are NOT entities.
+- Do not return entities whose names paraphrase these rules (e.g.
+  "compound entity preservation", "entity boundary", "critical rule").
+  Only return entities explicitly named in the input text.
+- Do not return entities whose names contain arrow notation or
+  bracket-encoded relations (e.g. "X→r→Y", "[r]"). These are notation.
+
+A. Compound technical identifiers are ONE entity, never multiple:
+   - "AWS us-east-1" → ONE entity "aws us-east-1" (NOT "aws" + "us-east-1")
+   - "GCP europe-west4" → ONE entity "gcp europe-west4"
+   - Cloud regions, fully-qualified service names, version numbers,
+     model IDs, and dotted/dashed identifiers stay intact as one entity.
+
+B. Preserve entity boundaries consistently. The same surface form must
+   always be extracted as the same single entity.
+
+---
+
+"""
+
+
+def patch_graph_entity_extraction() -> None:
+    """Inject compound-entity preservation into GraphMemory's entity prompt.
+
+    mem0ai's ``MemoryGraph._retrieve_nodes_from_data`` builds an inline
+    system prompt that does not mention compound-identifier preservation.
+    The relations prompt has the rule (see ``_AUGMENT_RULES`` rule B) but
+    the entity prompt does not. This causes a delete-cascade failure: at
+    add time the LLM keeps "AWS us-east-1" whole; at delete time it splits
+    on "aws", and the relation re-extraction then can't recreate the
+    matching triple, so ``_delete_entities`` finds nothing to soft-delete.
+
+    Fix: wrap ``_retrieve_nodes_from_data`` to prepend the rule onto the
+    LLM's system message for that one call.
+
+    Opt-out via ``MEM0_GRAPH_PROMPT_AUGMENT=false``. Idempotent.
+    """
+    if env("MEM0_GRAPH_PROMPT_AUGMENT", "true").lower() in ("false", "0", "no"):
+        logger.info("Skipping graph entity-extraction augmentation (opt-out)")
+        return
+
+    import mem0.memory.graph_memory as gm
+
+    original = gm.MemoryGraph._retrieve_nodes_from_data
+    if getattr(original, "_mem0_mcp_patched", False):
+        return  # Already patched
+
+    upstream_sentinel = "You are a smart assistant who understands entities"
+
+    def patched(self, data, filters):
+        original_generate = self.llm.generate_response
+
+        def wrapped_generate(messages, **kwargs):
+            for msg in messages:
+                if msg.get("role") == "system" and upstream_sentinel in msg.get(
+                    "content", ""
+                ):
+                    msg["content"] = _ENTITY_EXTRACT_AUGMENT + msg["content"]
+                    break
+            return original_generate(messages=messages, **kwargs)
+
+        self.llm.generate_response = wrapped_generate
+        try:
+            return original(self, data, filters)
+        finally:
+            self.llm.generate_response = original_generate
+
+    patched._mem0_mcp_patched = True
+    gm.MemoryGraph._retrieve_nodes_from_data = patched
+    logger.info(
+        "Patched MemoryGraph._retrieve_nodes_from_data with compound-entity rule"
+    )
+
+
+# Augmentation rules appended to mem0ai's FACT_RETRIEVAL_PROMPT.
+# Targets parenthetical-aliasing and similar-name conflation observed when the
+# fact extractor reads "X (Y's brother)" as "X also known as Y".
+_FACT_AUGMENT_RULES = """
+
+Additional fact-extraction rules — read carefully:
+
+A. Parenthetical clarifications are descriptors, NOT aliases.
+   In "X (Y's role/relation) ...", the parenthetical states X's
+   relationship to Y. X and Y are DISTINCT people. Do NOT emit any fact
+   of the form "X is also known as Y" or treat them as the same person.
+   - "Edvin (Eddie's brother) is married to Rita"
+     → facts: ["Edvin is Eddie's brother", "Edvin is married to Rita"]
+     NEVER: ["Edvin is also known as Eddie", "Edvin has a brother"]
+
+B. Two capitalized names that differ by even one character are DIFFERENT
+   people unless the text explicitly equates them. Preserve the exact
+   spelling. "Edvin" and "Eddie" are not the same person; "Karyn" and
+   "Karen" are not the same person.
+
+C. The subject of a sentence with a parenthetical about another person
+   is the named subject. "X (Y's friend) reviewed the PR" yields
+   "X reviewed the PR", not "Y reviewed the PR".
+"""
+
+
+def patch_fact_retrieval_prompt() -> None:
+    """Append augmentation rules to mem0ai's FACT_RETRIEVAL_PROMPT.
+
+    Opt-out via MEM0_FACT_PROMPT_AUGMENT=false (default: on). Idempotent
+    (sentinel-checked).
+
+    Patches both the source module (mem0.configs.prompts) and the importer
+    (mem0.memory.utils) since `from ... import` creates local bindings.
+
+    Must be called AFTER mem0 modules are imported but BEFORE
+    Memory.from_config().
+    """
+    if env("MEM0_FACT_PROMPT_AUGMENT", "true").lower() in ("false", "0", "no"):
+        logger.info("Skipping FACT_RETRIEVAL_PROMPT augmentation (opt-out)")
+        return
+
+    import mem0.configs.prompts as prompts_module
+
+    sentinel = "Additional fact-extraction rules — read carefully:"
+    if sentinel in prompts_module.FACT_RETRIEVAL_PROMPT:
+        return  # Already patched
+
+    augmented = prompts_module.FACT_RETRIEVAL_PROMPT + _FACT_AUGMENT_RULES
+    prompts_module.FACT_RETRIEVAL_PROMPT = augmented
+
+    try:
+        import mem0.memory.utils as utils_module
+
+        if hasattr(utils_module, "FACT_RETRIEVAL_PROMPT"):
+            utils_module.FACT_RETRIEVAL_PROMPT = augmented
+    except (ImportError, AttributeError):
+        pass
+
+    logger.info(
+        "Patched mem0ai FACT_RETRIEVAL_PROMPT with parenthetical disambiguation rules"
+    )
 
 
 def patch_gemini_parse_response() -> None:
@@ -201,7 +398,9 @@ def patch_gemini_parse_response() -> None:
     try:
         from mem0.llms.gemini import GeminiLLM
     except ImportError:
-        logger.debug("mem0.llms.gemini not available — skipping Gemini null guard patch")
+        logger.debug(
+            "mem0.llms.gemini not available — skipping Gemini null guard patch"
+        )
         return
 
     original = getattr(GeminiLLM, "_parse_response", None)
@@ -294,7 +493,81 @@ def call_with_graph(
         return func(*args, **kwargs)
 
 
-def safe_bulk_delete(memory: Any, filters: dict[str, Any], *, graph_enabled: bool = False) -> int:
+def gc_orphan_graph_nodes(
+    memory: Any, filters: dict[str, Any], *, recency_seconds: int = 30
+) -> int:
+    """Hard-delete graph nodes orphaned by a recent ``Memory.delete()`` cascade.
+
+    mem0ai's ``MemoryGraph._delete_entities`` only *soft*-deletes edges
+    (``r.valid = false``) for temporal reasoning. The endpoint nodes linger
+    even when no current memory references them anymore, leaking entities
+    in ``find_entity`` and ``get_entity`` results.
+
+    This function targets exactly those orphans without disturbing the
+    soft-delete machinery on edges that other memories still reference:
+
+      (a) Node has no remaining edge with ``valid IS NULL OR valid = true``
+          (i.e. nothing currently active references it).
+      (b) Node has at least one edge invalidated within the last
+          ``recency_seconds`` (proves *this* delete orphaned the node, so
+          we don't sweep nodes whose edges were invalidated long ago for
+          unrelated temporal-reasoning reasons).
+
+    Returns the count of nodes hard-deleted.
+    """
+    graph = getattr(memory, "graph", None)
+    if graph is None or "user_id" not in filters:
+        return 0
+
+    node_label = getattr(graph, "node_label", "") or ""
+
+    where_props = ["n.user_id = $user_id"]
+    params: dict[str, Any] = {
+        "user_id": filters["user_id"],
+        "recency": recency_seconds,
+    }
+    if filters.get("agent_id"):
+        where_props.append("n.agent_id = $agent_id")
+        params["agent_id"] = filters["agent_id"]
+    if filters.get("run_id"):
+        where_props.append("n.run_id = $run_id")
+        params["run_id"] = filters["run_id"]
+    where_str = " AND ".join(where_props)
+
+    cypher = f"""
+    MATCH (n {node_label})
+    WHERE {where_str}
+      AND NOT EXISTS {{
+        MATCH (n)-[r]-()
+        WHERE r.valid IS NULL OR r.valid = true
+      }}
+      AND EXISTS {{
+        MATCH (n)-[r2]-()
+        WHERE r2.valid = false
+          AND r2.invalidated_at >= datetime() - duration({{seconds: $recency}})
+      }}
+    WITH collect(n) AS orphans, count(n) AS cnt
+    FOREACH (x IN orphans | DETACH DELETE x)
+    RETURN cnt AS deleted
+    """
+    try:
+        rows = graph.graph.query(cypher, params=params)
+        deleted = (rows[0].get("deleted") if rows else 0) or 0
+        if deleted:
+            logger.info(
+                "GC: hard-deleted %d orphan graph node(s) after delete (filters=%s)",
+                deleted,
+                filters,
+            )
+        return deleted
+    except Exception as exc:
+        logger.warning("Orphan node GC failed for filters %s: %s", filters, exc)
+        return 0
+
+
+def safe_bulk_delete(
+    memory: Any, filters: dict[str, Any], *, graph_enabled: bool = False
+) -> int:
     """Safely delete all memories matching filters.
 
     NEVER calls memory.delete_all() (which triggers vector_store.reset()).
@@ -314,7 +587,13 @@ def safe_bulk_delete(memory: Any, filters: dict[str, Any], *, graph_enabled: boo
     count = 0
     for item in memories:
         # Extract memory_id from the Qdrant point
-        memory_id = item.id if hasattr(item, "id") else item.get("id") if isinstance(item, dict) else str(item)
+        memory_id = (
+            item.id
+            if hasattr(item, "id")
+            else item.get("id")
+            if isinstance(item, dict)
+            else str(item)
+        )
         try:
             memory.delete(memory_id)
             count += 1
@@ -352,8 +631,7 @@ def list_entities_facet(memory: Any) -> dict[str, list[dict]]:
                 key=payload_key,
             )
             result[result_key] = [
-                {"value": hit.value, "count": hit.count}
-                for hit in facet_response.hits
+                {"value": hit.value, "count": hit.count} for hit in facet_response.hits
             ]
         return result
     except Exception as exc:
