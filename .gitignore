@@ -38,6 +38,7 @@ Thumbs.db
 
 # Benchmark output
 benchmarks/*results*.json
+benchmarks/results/
 
 # Local development tooling
 .claude/
