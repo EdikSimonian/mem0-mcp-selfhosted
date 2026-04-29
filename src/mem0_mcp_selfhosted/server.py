@@ -26,6 +26,7 @@ from mem0_mcp_selfhosted.graph_tools import (
 )
 from mem0_mcp_selfhosted.helpers import (
     _mem0_call,
+    add_with_batch_provenance,
     call_with_graph,
     gc_orphan_graph_nodes,
     get_default_user_id,
@@ -244,23 +245,21 @@ def _register_tools(mcp: FastMCP) -> None:
         else:
             msgs = [{"role": "user", "content": text}]
 
-        kwargs: dict[str, Any] = {"user_id": uid}
-        if agent_id:
-            kwargs["agent_id"] = agent_id
-        if run_id:
-            kwargs["run_id"] = run_id
-        if metadata:
-            kwargs["metadata"] = metadata
-        if infer is not None:
-            kwargs["infer"] = infer
-
         mem = _ensure_memory()
-
-        def _do_add():
-            return mem.add(msgs, **kwargs)
+        effective_graph = (
+            enable_graph if enable_graph is not None else _enable_graph_default
+        )
 
         return _mem0_call(
-            call_with_graph, mem, enable_graph, _enable_graph_default, _do_add
+            add_with_batch_provenance,
+            mem,
+            msgs,
+            user_id=uid,
+            agent_id=agent_id,
+            run_id=run_id,
+            metadata=metadata,
+            infer=infer,
+            enable_graph=effective_graph,
         )
 
     @mcp.tool()

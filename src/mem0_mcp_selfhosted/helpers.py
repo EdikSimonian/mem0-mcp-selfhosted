@@ -4,6 +4,7 @@
 - _mem0_call(): Error wrapper for all mem0ai calls
 - call_with_graph(): Concurrency-safe enable_graph toggle
 - safe_bulk_delete(): Iterate + individual delete (never memory.delete_all())
+- add_with_batch_provenance(): Tag graph nodes/edges with batch_uuid for deterministic delete cascade
 - get_default_user_id(): Default user_id injection
 - list_entities_facet(): Qdrant Facet API entity listing with scroll fallback
 """
@@ -14,6 +15,7 @@ import json
 import logging
 import re
 import threading
+import uuid
 from typing import Any, Callable
 
 from mem0_mcp_selfhosted.env import bool_env, env
@@ -700,3 +702,349 @@ def _list_entities_scroll_fallback(memory: Any) -> dict[str, list[dict]]:
         "agents": [{"value": v, "count": c} for v, c in entities["agent_id"].items()],
         "runs": [{"value": v, "count": c} for v, c in entities["run_id"].items()],
     }
+
+
+# ---------------------------------------------------------------------------
+# Batch-UUID provenance: deterministic delete cascade for graph elements.
+#
+# Mem0ai's Memory.delete() cascade re-extracts entities from the deleted
+# memory's text and soft-deletes only graph edges that match the re-extraction
+# output. Re-extraction is non-deterministic across runs (especially on
+# abstract / code-heavy text), so the cleanup misses any edge whose extraction
+# drifted between add and delete time.
+#
+# Provenance design replaces re-extraction with explicit tagging. Each
+# add_memory call generates a batch_uuid stored in the vector payload and
+# stamped onto every graph node/edge mem0ai creates or matches in that call.
+# Delete reads the payload's batch_uuid, decides if any other vector memory
+# still references that batch, and if not, hard-deletes the tagged graph
+# elements deterministically.
+#
+# Surface assumed (pinned in tests/contract/test_provenance_invariants.py):
+#   - Memory.add submits vector + graph paths concurrently; both finish
+#     before mem.add() returns.
+#   - _create_memory deepcopies caller metadata into the Qdrant payload.
+#   - _add_entities sets `created` on nodes, `created_at` on relationship
+#     CREATE, and `updated_at` on relationship MATCH (all ms timestamps).
+#   - mem.graph.graph.query is the live Neo4j interface (Neo4jGraph wrapper
+#     under MemoryGraph.graph).
+# ---------------------------------------------------------------------------
+
+
+# Pass A: tag relations matched by triple identity AND timestamp window AND
+# scope. Triple identity comes from mem.add()'s returned added_entities, so
+# the timestamp window only has to filter same-millisecond collisions on
+# matching triples — not all activity in scope.
+_PASS_A_TAG_RELATIONS_CYPHER = """
+UNWIND $triples AS t
+MATCH (s {user_id: $uid, name: t.source})-[r]->(d {user_id: $uid, name: t.target})
+WHERE type(r) = t.relationship
+  AND ((r.created_at >= $start_ts) OR (r.updated_at >= $start_ts))
+  AND ($agent_id IS NULL OR (s.agent_id = $agent_id AND d.agent_id = $agent_id))
+  AND ($run_id   IS NULL OR (s.run_id   = $run_id   AND d.run_id   = $run_id))
+SET r.batch_uuids = CASE
+    WHEN $batch_uuid IN coalesce(r.batch_uuids, [])
+    THEN r.batch_uuids
+    ELSE coalesce(r.batch_uuids, []) + $batch_uuid
+END
+RETURN count(r) AS tagged
+"""
+
+# Pass B: backfill batch_uuid on endpoint nodes of any relation we just
+# tagged. Necessary because mem0ai's _add_entities only sets `created` on a
+# node when the node is NEW; an add that creates an edge between two existing
+# nodes leaves both endpoints' `created` untouched, so a created-time filter
+# would miss them. Pass B catches them via the now-tagged relations.
+_PASS_B_TAG_ENDPOINTS_CYPHER = """
+MATCH (s)-[r]->(d) WHERE $batch_uuid IN coalesce(r.batch_uuids, [])
+WITH collect(DISTINCT s) + collect(DISTINCT d) AS endpoints
+UNWIND endpoints AS n
+SET n.batch_uuids = CASE
+    WHEN $batch_uuid IN coalesce(n.batch_uuids, [])
+    THEN n.batch_uuids
+    ELSE coalesce(n.batch_uuids, []) + $batch_uuid
+END
+RETURN count(n) AS tagged
+"""
+
+# Hard-delete pass for relations: remove this batch_uuid from each tagged
+# relation's list; DELETE the relation only when its list empties (i.e. no
+# other batch still references it).
+_HARD_DELETE_RELATIONS_CYPHER = """
+MATCH ()-[r]->() WHERE $batch_uuid IN coalesce(r.batch_uuids, [])
+SET r.batch_uuids = [x IN r.batch_uuids WHERE x <> $batch_uuid]
+WITH r WHERE size(r.batch_uuids) = 0
+DELETE r
+RETURN count(r) AS deleted
+"""
+
+# Hard-delete pass for nodes: same removal+empty-only-delete pattern, plus
+# `NOT (n)--()` so we never delete a node still connected by an untagged or
+# manual relationship (defensive — provenance shouldn't bulldoze unrelated
+# state).
+_HARD_DELETE_NODES_CYPHER = """
+MATCH (n) WHERE $batch_uuid IN coalesce(n.batch_uuids, [])
+SET n.batch_uuids = [x IN n.batch_uuids WHERE x <> $batch_uuid]
+WITH n WHERE size(n.batch_uuids) = 0 AND NOT (n)--()
+DETACH DELETE n
+RETURN count(n) AS deleted
+"""
+
+
+def _neo4j_now(memory: Any) -> int:
+    """Return Neo4j server's current ms timestamp.
+
+    Anchoring reconciliation windows on the Neo4j clock dodges client/server
+    skew that would otherwise let the timestamp filter mis-classify edges.
+    """
+    rows = memory.graph.graph.query("RETURN timestamp() AS now")
+    return int(rows[0]["now"])
+
+
+def _flatten_added_entities(added_entities: Any) -> list[dict[str, str]]:
+    """Flatten mem0ai's added_entities shape into a flat list of triple dicts.
+
+    Mem0ai returns added_entities as list-of-list-of-triples (one inner list
+    per processed message). We need a flat list keyed only by source /
+    relationship / target.
+    """
+    triples: list[dict[str, str]] = []
+    if not added_entities:
+        return triples
+
+    for sublist in added_entities:
+        if isinstance(sublist, list):
+            iterable = sublist
+        elif isinstance(sublist, dict):
+            iterable = [sublist]
+        else:
+            continue
+        for item in iterable:
+            if not isinstance(item, dict):
+                continue
+            if not all(k in item for k in ("source", "relationship", "target")):
+                continue
+            triples.append(
+                {
+                    "source": item["source"],
+                    "relationship": item["relationship"],
+                    "target": item["target"],
+                }
+            )
+    return triples
+
+
+def tag_batch_provenance(
+    memory: Any,
+    *,
+    batch_uuid: str,
+    start_ts: int,
+    user_id: str,
+    agent_id: str | None,
+    run_id: str | None,
+    added_entities: Any,
+) -> tuple[int, int]:
+    """Run Pass A (relations) + Pass B (endpoint backfill).
+
+    Returns (relations_tagged, nodes_tagged). Returns (0, 0) and skips Cypher
+    entirely when there's nothing to tag (no graph, no extracted relations).
+    """
+    if memory.graph is None:
+        return (0, 0)
+
+    triples = _flatten_added_entities(added_entities)
+    if not triples:
+        return (0, 0)
+
+    pass_a_params: dict[str, Any] = {
+        "triples": triples,
+        "uid": user_id,
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "start_ts": start_ts,
+        "batch_uuid": batch_uuid,
+    }
+    a_rows = memory.graph.graph.query(
+        _PASS_A_TAG_RELATIONS_CYPHER, params=pass_a_params
+    )
+    rel_tagged = (a_rows[0].get("tagged") if a_rows else 0) or 0
+
+    if rel_tagged == 0:
+        # Nothing matched — likely a sanitizer/normalization mismatch between
+        # added_entities and stored type(r). Don't run Pass B (it would
+        # collect endpoints from prior batches' tagged edges, not this one).
+        return (0, 0)
+
+    b_params = {"batch_uuid": batch_uuid}
+    b_rows = memory.graph.graph.query(_PASS_B_TAG_ENDPOINTS_CYPHER, params=b_params)
+    node_tagged = (b_rows[0].get("tagged") if b_rows else 0) or 0
+    return (rel_tagged, node_tagged)
+
+
+def hard_delete_batch(memory: Any, batch_uuid: str) -> tuple[int, int]:
+    """Hard-delete all graph elements tagged with the given batch_uuid.
+
+    Removes batch_uuid from list properties; deletes relations whose list
+    empties; detach-deletes nodes whose list empties AND have no remaining
+    relationships. Returns (relations_deleted, nodes_deleted).
+    """
+    if memory.graph is None:
+        return (0, 0)
+
+    params = {"batch_uuid": batch_uuid}
+    rel_rows = memory.graph.graph.query(_HARD_DELETE_RELATIONS_CYPHER, params=params)
+    rel_deleted = (rel_rows[0].get("deleted") if rel_rows else 0) or 0
+
+    node_rows = memory.graph.graph.query(_HARD_DELETE_NODES_CYPHER, params=params)
+    node_deleted = (node_rows[0].get("deleted") if node_rows else 0) or 0
+
+    if rel_deleted or node_deleted:
+        logger.info(
+            "Hard-deleted batch %s: %d relation(s), %d node(s)",
+            batch_uuid,
+            rel_deleted,
+            node_deleted,
+        )
+    return (rel_deleted, node_deleted)
+
+
+def count_batch_anchors(
+    memory: Any,
+    *,
+    batch_uuid: str,
+    user_id: str,
+    agent_id: str | None,
+    run_id: str | None,
+) -> int:
+    """Count vector memories carrying this batch_uuid in the same scope.
+
+    Used post-add to detect orphan-from-birth (no anchor → reclaim graph),
+    and pre-delete to decide whether the graph batch can be reclaimed.
+    """
+    filters: dict[str, Any] = {"user_id": user_id, "batch_uuid": batch_uuid}
+    if agent_id:
+        filters["agent_id"] = agent_id
+    if run_id:
+        filters["run_id"] = run_id
+
+    # 100 is plenty: a single add_memory call produces at most a handful of
+    # facts (typically 1-5). If we ever produce >100 in one batch, scope filters
+    # will undercount and orphan-from-birth detection will mis-fire — easy to
+    # spot in logs and bump the limit.
+    result = memory.vector_store.list(filters=filters, limit=100)
+    points = result[0] if isinstance(result, tuple) else result
+    return len(points or [])
+
+
+def add_with_batch_provenance(
+    memory: Any,
+    messages: list[dict],
+    *,
+    user_id: str,
+    agent_id: str | None = None,
+    run_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    infer: bool | None = None,
+    enable_graph: bool,
+) -> dict:
+    """Add messages with batch-UUID provenance tagging.
+
+    Generates a batch_uuid, attaches it to vector payloads via metadata, then
+    Cypher-tags graph nodes/edges from this add under the same lock. Replaces
+    re-extraction-based delete cascades with deterministic provenance.
+
+    The lock spans add+reconcile so:
+      - Other requests can't flip enable_graph mid-call (existing concern).
+      - Concurrent adds can't contaminate each other's timestamp window.
+
+    If reconciliation fails, the underlying mem.add() result is still
+    returned — the vector store is intact, only the graph tagging is missing.
+    Operators can fall back to safe_bulk_delete on the scope to clean up.
+
+    Returns mem0ai's normal {"results": [...], "relations": {...}} dict.
+    """
+    batch_uuid = str(uuid.uuid4())
+    metadata = dict(metadata or {})
+    metadata["batch_uuid"] = batch_uuid
+
+    add_kwargs: dict[str, Any] = {"user_id": user_id, "metadata": metadata}
+    if agent_id:
+        add_kwargs["agent_id"] = agent_id
+    if run_id:
+        add_kwargs["run_id"] = run_id
+    if infer is not None:
+        add_kwargs["infer"] = infer
+
+    with _graph_lock:
+        memory.enable_graph = enable_graph and memory.graph is not None
+        graph_active = memory.enable_graph
+
+        if not graph_active:
+            # No graph extraction this call — nothing to reconcile. The
+            # batch_uuid sits in vector payload anyway, harmless if unused.
+            return memory.add(messages, **add_kwargs)
+
+        try:
+            start_ts = _neo4j_now(memory)
+        except Exception as exc:
+            logger.warning(
+                "Failed to anchor Neo4j start_ts for batch %s; "
+                "falling back to plain add (no provenance tagging): %s",
+                batch_uuid,
+                exc,
+            )
+            return memory.add(messages, **add_kwargs)
+
+        result = memory.add(messages, **add_kwargs)
+
+        try:
+            relations_payload = (
+                result.get("relations", {}) if isinstance(result, dict) else {}
+            )
+            added = (
+                relations_payload.get("added_entities", [])
+                if isinstance(relations_payload, dict)
+                else []
+            )
+
+            tag_batch_provenance(
+                memory,
+                batch_uuid=batch_uuid,
+                start_ts=start_ts,
+                user_id=user_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                added_entities=added,
+            )
+
+            # Orphan-from-birth check is only meaningful when there's something
+            # to orphan. Skip the Qdrant scroll if no relations were extracted.
+            if added:
+                anchors = count_batch_anchors(
+                    memory,
+                    batch_uuid=batch_uuid,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                )
+                if anchors == 0:
+                    # Graph relations were created but the vector path produced
+                    # only UPDATE/NOOP events, so no memory carries the
+                    # batch_uuid as ownership anchor. Reclaim now.
+                    logger.info(
+                        "Orphan-from-birth for batch %s: %d added entities but 0 "
+                        "anchor memories — hard-deleting graph batch",
+                        batch_uuid,
+                        sum(len(s) if isinstance(s, list) else 1 for s in added),
+                    )
+                    hard_delete_batch(memory, batch_uuid)
+        except Exception as exc:
+            logger.error(
+                "Batch provenance reconciliation failed for batch %s: %s. "
+                "Vector memory is intact; graph elements may be missing "
+                "batch_uuid tags. Fall back to safe_bulk_delete on scope.",
+                batch_uuid,
+                exc,
+            )
+
+        return result

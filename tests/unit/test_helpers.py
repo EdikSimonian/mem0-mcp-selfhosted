@@ -8,14 +8,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mem0_mcp_selfhosted.helpers import (
+    _flatten_added_entities,
     _make_enhanced_sanitizer,
     _mem0_call,
+    add_with_batch_provenance,
     call_with_graph,
+    count_batch_anchors,
     gc_orphan_graph_nodes,
     get_default_user_id,
+    hard_delete_batch,
     patch_extract_relations_prompt,
     patch_gemini_parse_response,
     safe_bulk_delete,
+    tag_batch_provenance,
 )
 
 
@@ -515,3 +520,332 @@ class TestPatchExtractRelationsPrompt:
         before = utils_module.EXTRACT_RELATIONS_PROMPT
         patch_extract_relations_prompt()
         assert utils_module.EXTRACT_RELATIONS_PROMPT == before
+
+
+# ============================================================
+# Batch-UUID provenance helpers (Phase 1)
+# ============================================================
+
+
+class TestFlattenAddedEntities:
+    """_flatten_added_entities normalizes mem0ai's nested return shape."""
+
+    def test_flattens_list_of_lists(self):
+        nested = [
+            [{"source": "a", "relationship": "R1", "target": "b"}],
+            [
+                {"source": "c", "relationship": "R2", "target": "d"},
+                {"source": "e", "relationship": "R3", "target": "f"},
+            ],
+        ]
+        flat = _flatten_added_entities(nested)
+        assert len(flat) == 3
+        assert flat[0] == {"source": "a", "relationship": "R1", "target": "b"}
+
+    def test_handles_flat_dicts_in_outer_list(self):
+        flat_input = [{"source": "a", "relationship": "R", "target": "b"}]
+        out = _flatten_added_entities(flat_input)
+        assert out == [{"source": "a", "relationship": "R", "target": "b"}]
+
+    def test_drops_malformed_items(self):
+        nested = [
+            [{"source": "a", "relationship": "R", "target": "b"}],
+            [{"source": "no_target", "relationship": "R"}],  # missing target
+            ["string_garbage"],  # non-dict
+        ]
+        flat = _flatten_added_entities(nested)
+        assert len(flat) == 1
+        assert flat[0]["source"] == "a"
+
+    def test_empty_input(self):
+        assert _flatten_added_entities([]) == []
+        assert _flatten_added_entities(None) == []
+
+
+class TestTagBatchProvenance:
+    """tag_batch_provenance runs Pass A + Pass B Cypher under the right conditions."""
+
+    def test_skips_when_graph_is_none(self):
+        memory = MagicMock()
+        memory.graph = None
+        rel, node = tag_batch_provenance(
+            memory,
+            batch_uuid="b1",
+            start_ts=1000,
+            user_id="u",
+            agent_id=None,
+            run_id=None,
+            added_entities=[[{"source": "x", "relationship": "R", "target": "y"}]],
+        )
+        assert (rel, node) == (0, 0)
+
+    def test_skips_when_no_relations(self):
+        memory = MagicMock()
+        memory.graph = MagicMock()
+        rel, node = tag_batch_provenance(
+            memory,
+            batch_uuid="b1",
+            start_ts=1000,
+            user_id="u",
+            agent_id=None,
+            run_id=None,
+            added_entities=[],
+        )
+        assert (rel, node) == (0, 0)
+        memory.graph.graph.query.assert_not_called()
+
+    def test_runs_pass_a_then_pass_b_when_relations_match(self):
+        memory = MagicMock()
+        # First call (Pass A) returns 2 tagged; second (Pass B) returns 3.
+        memory.graph.graph.query.side_effect = [
+            [{"tagged": 2}],
+            [{"tagged": 3}],
+        ]
+        rel, node = tag_batch_provenance(
+            memory,
+            batch_uuid="b1",
+            start_ts=1000,
+            user_id="u",
+            agent_id="a",
+            run_id="r",
+            added_entities=[[{"source": "x", "relationship": "R", "target": "y"}]],
+        )
+        assert rel == 2
+        assert node == 3
+        assert memory.graph.graph.query.call_count == 2
+
+        # Pass A params include scope, triples, batch_uuid, start_ts.
+        pass_a_call = memory.graph.graph.query.call_args_list[0]
+        params = pass_a_call.kwargs["params"]
+        assert params["uid"] == "u"
+        assert params["agent_id"] == "a"
+        assert params["run_id"] == "r"
+        assert params["batch_uuid"] == "b1"
+        assert params["start_ts"] == 1000
+        assert params["triples"] == [
+            {"source": "x", "relationship": "R", "target": "y"}
+        ]
+
+    def test_skips_pass_b_when_pass_a_tags_zero(self):
+        """If Pass A doesn't match any relations (e.g. sanitizer drift),
+        Pass B would tag endpoints from prior batches' edges — skip it."""
+        memory = MagicMock()
+        memory.graph.graph.query.return_value = [{"tagged": 0}]
+        rel, node = tag_batch_provenance(
+            memory,
+            batch_uuid="b1",
+            start_ts=1000,
+            user_id="u",
+            agent_id=None,
+            run_id=None,
+            added_entities=[[{"source": "x", "relationship": "R", "target": "y"}]],
+        )
+        assert (rel, node) == (0, 0)
+        # Only Pass A should have been queried.
+        assert memory.graph.graph.query.call_count == 1
+
+
+class TestHardDeleteBatch:
+    def test_skips_when_graph_is_none(self):
+        memory = MagicMock()
+        memory.graph = None
+        assert hard_delete_batch(memory, "b1") == (0, 0)
+
+    def test_runs_relations_then_nodes_cypher(self):
+        memory = MagicMock()
+        memory.graph.graph.query.side_effect = [
+            [{"deleted": 4}],  # relations
+            [{"deleted": 2}],  # nodes
+        ]
+        rel, node = hard_delete_batch(memory, "b1")
+        assert (rel, node) == (4, 2)
+        assert memory.graph.graph.query.call_count == 2
+        for call in memory.graph.graph.query.call_args_list:
+            assert call.kwargs["params"] == {"batch_uuid": "b1"}
+
+
+class TestCountBatchAnchors:
+    def test_counts_qdrant_points(self):
+        memory = MagicMock()
+        # Qdrant.scroll returns (records_list, next_offset)
+        memory.vector_store.list.return_value = (
+            [MagicMock(), MagicMock(), MagicMock()],
+            None,
+        )
+        n = count_batch_anchors(
+            memory,
+            batch_uuid="b1",
+            user_id="u",
+            agent_id=None,
+            run_id=None,
+        )
+        assert n == 3
+
+        filters = memory.vector_store.list.call_args.kwargs["filters"]
+        assert filters == {"user_id": "u", "batch_uuid": "b1"}
+
+    def test_includes_agent_and_run_in_filters(self):
+        memory = MagicMock()
+        memory.vector_store.list.return_value = ([], None)
+        count_batch_anchors(
+            memory,
+            batch_uuid="b1",
+            user_id="u",
+            agent_id="a",
+            run_id="r",
+        )
+        filters = memory.vector_store.list.call_args.kwargs["filters"]
+        assert filters == {
+            "user_id": "u",
+            "batch_uuid": "b1",
+            "agent_id": "a",
+            "run_id": "r",
+        }
+
+
+class TestAddWithBatchProvenance:
+    """End-to-end orchestration: lock, metadata injection, reconciliation, orphan check."""
+
+    def _make_memory(self, *, graph_active=True, anchors=1, added=None):
+        """Build a Memory mock that simulates a graph-enabled add."""
+        memory = MagicMock()
+        memory.graph = MagicMock() if graph_active else None
+        # _neo4j_now: first query (timestamp). Then Pass A (tagged>0). Then Pass B.
+        memory.graph.graph.query.side_effect = [
+            [{"now": 1000}],
+            [{"tagged": 1}],
+            [{"tagged": 2}],
+        ]
+        memory.add.return_value = {
+            "results": [{"id": "mid", "memory": "fact", "event": "ADD"}],
+            "relations": {
+                "added_entities": added
+                if added is not None
+                else [[{"source": "x", "relationship": "R", "target": "y"}]],
+            },
+        }
+        memory.vector_store.list.return_value = (
+            [MagicMock() for _ in range(anchors)],
+            None,
+        )
+        return memory
+
+    def test_injects_batch_uuid_into_metadata(self):
+        memory = self._make_memory()
+        add_with_batch_provenance(
+            memory,
+            [{"role": "user", "content": "hi"}],
+            user_id="u",
+            metadata={"source": "chat"},
+            enable_graph=True,
+        )
+        call_kwargs = memory.add.call_args.kwargs
+        assert call_kwargs["metadata"]["source"] == "chat"
+        assert "batch_uuid" in call_kwargs["metadata"]
+        assert len(call_kwargs["metadata"]["batch_uuid"]) == 36  # uuid4
+
+    def test_caller_metadata_is_not_mutated(self):
+        """Defensive copy: caller's dict must not gain batch_uuid in-place."""
+        memory = self._make_memory()
+        caller_metadata = {"source": "chat"}
+        add_with_batch_provenance(
+            memory,
+            [{"role": "user", "content": "hi"}],
+            user_id="u",
+            metadata=caller_metadata,
+            enable_graph=True,
+        )
+        assert "batch_uuid" not in caller_metadata
+        assert caller_metadata == {"source": "chat"}
+
+    def test_skips_reconciliation_when_graph_disabled(self):
+        memory = self._make_memory()
+        add_with_batch_provenance(
+            memory,
+            [{"role": "user", "content": "hi"}],
+            user_id="u",
+            enable_graph=False,
+        )
+        # No graph queries should run.
+        memory.graph.graph.query.assert_not_called()
+        # mem.enable_graph should be False during the call.
+        assert memory.add.called
+
+    def test_runs_full_reconciliation_when_graph_enabled(self):
+        memory = self._make_memory()
+        add_with_batch_provenance(
+            memory,
+            [{"role": "user", "content": "hi"}],
+            user_id="u",
+            enable_graph=True,
+        )
+        # Three queries: timestamp anchor, Pass A, Pass B.
+        assert memory.graph.graph.query.call_count == 3
+
+    def test_orphan_from_birth_triggers_hard_delete(self):
+        """When mem.add() reports added_entities but Qdrant has 0 anchors,
+        the just-tagged batch must be hard-deleted immediately."""
+        memory = self._make_memory(anchors=0)
+        # Extend the side_effect to cover the hard-delete passes (rels + nodes).
+        memory.graph.graph.query.side_effect = [
+            [{"now": 1000}],
+            [{"tagged": 1}],
+            [{"tagged": 2}],
+            [{"deleted": 1}],
+            [{"deleted": 2}],
+        ]
+        add_with_batch_provenance(
+            memory,
+            [{"role": "user", "content": "hi"}],
+            user_id="u",
+            enable_graph=True,
+        )
+        # 5 queries: timestamp + Pass A + Pass B + hard_delete relations + nodes.
+        assert memory.graph.graph.query.call_count == 5
+
+    def test_no_orphan_check_when_added_is_empty(self):
+        """If the LLM extracted no relations, orphan-from-birth is impossible
+        — skip the Qdrant scroll entirely."""
+        memory = self._make_memory(added=[], anchors=0)
+        memory.graph.graph.query.side_effect = [[{"now": 1000}]]
+        add_with_batch_provenance(
+            memory,
+            [{"role": "user", "content": "hi"}],
+            user_id="u",
+            enable_graph=True,
+        )
+        # Only timestamp anchor — no Pass A, no Pass B, no scroll.
+        assert memory.graph.graph.query.call_count == 1
+        memory.vector_store.list.assert_not_called()
+
+    def test_reconciliation_failure_does_not_break_add(self):
+        """If Cypher reconciliation throws after mem.add() succeeds, the
+        add() result is still returned; vector store stays intact."""
+        memory = self._make_memory()
+        memory.graph.graph.query.side_effect = [
+            [{"now": 1000}],
+            RuntimeError("Neo4j down mid-reconciliation"),
+        ]
+        result = add_with_batch_provenance(
+            memory,
+            [{"role": "user", "content": "hi"}],
+            user_id="u",
+            enable_graph=True,
+        )
+        # Add result preserved.
+        assert result["results"][0]["id"] == "mid"
+
+    def test_neo4j_now_failure_falls_back_to_plain_add(self):
+        """If we can't anchor the timestamp window, plain add (no provenance)
+        runs instead — better than blocking the user."""
+        memory = self._make_memory()
+        memory.graph.graph.query.side_effect = RuntimeError("Neo4j unreachable")
+        result = add_with_batch_provenance(
+            memory,
+            [{"role": "user", "content": "hi"}],
+            user_id="u",
+            enable_graph=True,
+        )
+        # mem.add was still called; result returned.
+        assert memory.add.called
+        assert result["results"][0]["id"] == "mid"

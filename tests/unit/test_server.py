@@ -7,7 +7,6 @@ defaults, scope validation, error handling, and delegation to helpers.
 from __future__ import annotations
 
 import json
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -83,7 +82,11 @@ class TestAddMemory:
         args, kwargs = mem.add.call_args
         assert args[0] == [{"role": "user", "content": "I prefer Python"}]
         assert kwargs["user_id"] == "alice"
-        assert kwargs["metadata"] == {"source": "chat"}
+        # Caller's metadata is preserved AND batch_uuid is injected for
+        # provenance tracking (see add_with_batch_provenance in helpers.py).
+        assert kwargs["metadata"]["source"] == "chat"
+        assert "batch_uuid" in kwargs["metadata"]
+        assert len(kwargs["metadata"]["batch_uuid"]) == 36  # uuid4 string form
         assert kwargs["infer"] is False
         parsed = json.loads(result)
         assert "results" in parsed
@@ -91,7 +94,10 @@ class TestAddMemory:
     def test_messages_precedence(self, server_with_mock):
         srv, mem = server_with_mock
         fn = _get_tool_fn(srv, "add_memory")
-        custom_msgs = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]
+        custom_msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
         fn(text="ignored text", messages=custom_msgs)
         args, _ = mem.add.call_args
         assert args[0] == custom_msgs
@@ -190,7 +196,9 @@ class TestDeleteAllMemories:
         srv, mem = server_with_mock
         fn = _get_tool_fn(srv, "delete_all_memories")
         result = fn()
-        mock_sbd.assert_called_once_with(mem, {"user_id": "test-user"}, graph_enabled=False)
+        mock_sbd.assert_called_once_with(
+            mem, {"user_id": "test-user"}, graph_enabled=False
+        )
         parsed = json.loads(result)
         assert parsed["count"] == 0
 
@@ -312,7 +320,9 @@ class TestInitMemory:
     @patch("mem0.Memory.from_config")
     @patch("mem0.utils.factory.LlmFactory.register_provider")
     @patch("mem0_mcp_selfhosted.server.build_config")
-    def test_registers_ollama_only(self, mock_bc, mock_reg, mock_from_config, mock_patch):
+    def test_registers_ollama_only(
+        self, mock_bc, mock_reg, mock_from_config, mock_patch
+    ):
         """When LLM is ollama, only ollama provider is registered (always included)."""
         mock_memory = MagicMock()
         mock_memory.graph = None
@@ -350,7 +360,9 @@ class TestInitMemory:
         )
         server_mod._init_memory()
         mock_patch.assert_called_once()
-        assert call_order.index("patch_graph_sanitizer") < call_order.index("from_config"), (
+        assert call_order.index("patch_graph_sanitizer") < call_order.index(
+            "from_config"
+        ), (
             f"patch_graph_sanitizer must be called before Memory.from_config, got: {call_order}"
         )
 
@@ -379,9 +391,14 @@ class TestRegisterProviders:
     @patch("mem0.utils.factory.LlmFactory.register_provider")
     def test_anthropic_oat_registers_without_error(self, mock_reg):
         """anthropic_oat provider registers successfully with LlmFactory."""
-        server_mod.register_providers([
-            {"name": "anthropic_oat", "class_path": "mem0_mcp_selfhosted.llm_anthropic.AnthropicOATLLM"},
-        ])
+        server_mod.register_providers(
+            [
+                {
+                    "name": "anthropic_oat",
+                    "class_path": "mem0_mcp_selfhosted.llm_anthropic.AnthropicOATLLM",
+                },
+            ]
+        )
         mock_reg.assert_called_once()
         assert mock_reg.call_args[1]["name"] == "anthropic_oat"
 
@@ -389,9 +406,11 @@ class TestRegisterProviders:
     def test_unknown_provider_logs_warning(self, mock_reg):
         """Unknown provider name logs a warning and is skipped."""
         with patch("mem0_mcp_selfhosted.server.logger") as mock_logger:
-            server_mod.register_providers([
-                {"name": "unknown_provider", "class_path": "some.module.SomeClass"},
-            ])
+            server_mod.register_providers(
+                [
+                    {"name": "unknown_provider", "class_path": "some.module.SomeClass"},
+                ]
+            )
         mock_logger.warning.assert_called_once()
         assert "unknown_provider" in mock_logger.warning.call_args[0][1]
         mock_reg.assert_not_called()
@@ -401,7 +420,9 @@ class TestCreateServer:
     def test_registers_11_tools(self):
         srv = server_mod._create_server()
         tools = srv._tool_manager._tools
-        assert len(tools) == 11, f"Expected 11 tools, got {len(tools)}: {list(tools.keys())}"
+        assert len(tools) == 11, (
+            f"Expected 11 tools, got {len(tools)}: {list(tools.keys())}"
+        )
 
     def test_registers_prompt(self):
         srv = server_mod._create_server()
@@ -507,7 +528,10 @@ class TestToolsWithNoMemory:
         server_mod.memory = original
         server_mod._last_init_failure = original_failure
 
-    @patch("mem0_mcp_selfhosted.server._init_memory", side_effect=ConnectionError("no qdrant"))
+    @patch(
+        "mem0_mcp_selfhosted.server._init_memory",
+        side_effect=ConnectionError("no qdrant"),
+    )
     def test_add_memory_returns_error(self, mock_init):
         srv = server_mod._create_server()
         fn = _get_tool_fn(srv, "add_memory")
@@ -515,7 +539,10 @@ class TestToolsWithNoMemory:
         parsed = json.loads(result)
         assert "error" in parsed
 
-    @patch("mem0_mcp_selfhosted.server._init_memory", side_effect=ConnectionError("no qdrant"))
+    @patch(
+        "mem0_mcp_selfhosted.server._init_memory",
+        side_effect=ConnectionError("no qdrant"),
+    )
     def test_search_memories_returns_error(self, mock_init):
         srv = server_mod._create_server()
         fn = _get_tool_fn(srv, "search_memories")
@@ -523,7 +550,10 @@ class TestToolsWithNoMemory:
         parsed = json.loads(result)
         assert "error" in parsed
 
-    @patch("mem0_mcp_selfhosted.server._init_memory", side_effect=ConnectionError("no qdrant"))
+    @patch(
+        "mem0_mcp_selfhosted.server._init_memory",
+        side_effect=ConnectionError("no qdrant"),
+    )
     def test_get_memories_returns_error(self, mock_init):
         srv = server_mod._create_server()
         fn = _get_tool_fn(srv, "get_memories")
@@ -531,7 +561,10 @@ class TestToolsWithNoMemory:
         parsed = json.loads(result)
         assert parsed["error"] == "Memory not initialized"
 
-    @patch("mem0_mcp_selfhosted.server._init_memory", side_effect=ConnectionError("no qdrant"))
+    @patch(
+        "mem0_mcp_selfhosted.server._init_memory",
+        side_effect=ConnectionError("no qdrant"),
+    )
     def test_get_memory_returns_error(self, mock_init):
         srv = server_mod._create_server()
         fn = _get_tool_fn(srv, "get_memory")
