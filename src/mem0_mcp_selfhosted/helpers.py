@@ -1106,11 +1106,7 @@ def delete_memory_with_batch(
         if val:
             scope[key] = val
 
-    use_legacy_path = (
-        batch_uuid is None
-        or memory.graph is None
-        or not enable_graph
-    )
+    use_legacy_path = batch_uuid is None or memory.graph is None or not enable_graph
 
     with _graph_lock:
         if use_legacy_path:

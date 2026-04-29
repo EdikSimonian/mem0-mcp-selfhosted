@@ -57,7 +57,7 @@ Verify the tool list contains `find_entity` and `get_entity`. The pre-rename nam
 
 The smoke-test surface forms must NOT appear verbatim in `helpers.py:_AUGMENT_RULES` or `_ENTITY_EXTRACT_AUGMENT` — otherwise we're testing whether the LLM regurgitates the prompt, not whether the rules generalize. Current safe names: BlueOcean, Acme, Priya, `cloud-region-7`. If you change `_AUGMENT_RULES`, audit this step.
 
-Call `add_memory` with text `"SmokeTest: BlueOcean runs in Acme cloud-region-7. Priya leads BlueOcean at Acme."`, `run_id="smoke-test"`, `enable_graph=true`. Then call `find_entity("acme")`. Expect:
+Call `add_memory` with text `"BlueOcean runs in Acme cloud-region-7. Priya leads BlueOcean at Acme."`, `run_id="smoke-test"`, `enable_graph=true`. Then call `find_entity("acme")`. Expect:
 - A node literally named `acme cloud-region-7` (proves compound-entity preservation rule generalizes to a region string the prompt never mentions).
 - An edge along the lines of `blueocean --[owned_by]--> acme` (proves the org→thing rule generalizes).
 - No self-loop edge with source == target (proves rule A holds).
@@ -68,14 +68,14 @@ If `acme` and `cloud-region-7` come back as separate nodes: augmented prompt did
 
 This is the original failure mode the batch_uuid design was built for: under the old `gc_orphan_graph_nodes` path, mem0ai's delete-time re-extraction would drift on abstract input and miss the soft-delete, leaking endpoint nodes. Under the new design, every node/edge `_add_entities` creates is Cypher-tagged with the call's `batch_uuid` (also stored in vector payload), and `delete_memory_with_batch` hard-deletes the entire tagged batch deterministically once the last anchor memory is gone — bypassing re-extraction entirely.
 
-Call `add_memory` with text `"DocSmoke: orion_service depends on polaris_module which is maintained by team_vega."`, `run_id="smoke-test-single"`, `enable_graph=true`. The fact extractor produces 3 vector memories; the graph extractor produces 2 relations (`orion_service --[depends_on]--> polaris_module` and `polaris_module --[maintained_by]--> team_vega`). Note every memory ID. Then call `delete_memory(memory_id=..., enable_graph=true)` for each ID in turn:
+Call `add_memory` with text `"orion_service depends on polaris_module which is maintained by team_vega."`, `run_id="smoke-test-single"`, `enable_graph=true`. The fact extractor produces 3 vector memories; the graph extractor produces 2 relations (`orion_service --[depends_on]--> polaris_module` and `polaris_module --[maintained_by]--> team_vega`). Note every memory ID. Then call `delete_memory(memory_id=..., enable_graph=true)` for each ID in turn:
 
 - After deletes #1 and #2: `find_entity("orion")` should still return `orion_service` (anchor count > 0).
 - After delete #3 (last anchor): `hard_delete_batch` fires. `find_entity("orion")`, `find_entity("polaris")`, `find_entity("team_vega")` should all return empty `entities`. `list_entities` should not show `smoke-test-single` under `runs`.
 
 The hard-delete is keyed by Cypher tag, not by re-extracted triple identity, so it works regardless of whether the delete-time entity prompt would match. Surface forms (`orion_service`, `polaris_module`, `team_vega`) deliberately avoid the `_AUGMENT_RULES` exemplars.
 
-Variant — orphan-from-birth: text like `"NoteSmoke: helpers.py exposes rule_a which augments rule_b in graph_tools.py."` makes the fact extractor return zero memories while the graph extractor still creates relations. Adding this exercises the *add-time* reclaim path: `add_with_batch_provenance` detects 0 anchors with that batch_uuid and calls `hard_delete_batch` immediately. Expect `add_memory` to return `"results": []`, and `find_entity("rule_a")` to return empty straight away.
+Variant — orphan-from-birth: text like `"helpers.py exposes rule_a which augments rule_b in graph_tools.py."` makes the fact extractor return zero memories while the graph extractor still creates relations. Surface forms here deliberately avoid colon-prefixed labels (`Note:`, `SmokeTest:`, `ProbeE3:`) — Haiku-class relation extractors parse short leading colon-prefix labels as the syntactic subject of the sentence body and emit them as edge sources, contaminating triples. Adding this exercises the *add-time* reclaim path: `add_with_batch_provenance` detects 0 anchors with that batch_uuid and calls `hard_delete_batch` immediately. Expect `add_memory` to return `"results": []`, and `find_entity("rule_a")` to return empty straight away.
 
 ### 3. Multi-memory batch defers cleanup to last-anchor delete (batch_uuid contract)
 
