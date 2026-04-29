@@ -329,3 +329,184 @@ class TestBatchProvenanceEndToEnd:
             params={"rid": run_id},
         )
         assert rows[0]["cnt"] == 0
+
+    def test_abstract_config_note_no_leak(self, memory_instance, isolated_scope):
+        """The failure mode that motivated the whole design.
+
+        Memory `1df3d64f` flagged this as HIGH-severity: when memory text mentions
+        code identifiers ("helpers.py", "_AUGMENT_RULES", "rule_a"), Haiku-class
+        extraction over-produces graph nodes for the rule names and file paths.
+        The pre-provenance gc_orphan path could not catch them on delete because
+        re-extraction generates DIFFERENT triples than add-time, leaving orphans
+        that lingered in find_entity / get_entity until manual Cypher swept them.
+
+        Provenance design's contract: regardless of what extraction produced,
+        delete must hard-delete every tagged node/edge in the batch.
+        """
+        from mem0_mcp_selfhosted.helpers import (
+            add_with_batch_provenance,
+            delete_memory_with_batch,
+        )
+
+        run_id = isolated_scope
+        # Abstract text mirroring the kind of save that previously leaked.
+        # Names randomized to dodge any LLM-side memorization of the shape.
+        token = uuid.uuid4().hex[:8]
+        text = (
+            f"ConfigNote-{token}: helpers_module_{token} contains rule_a, rule_b, "
+            f"and rule_c. Each rule is appended to extract_relations_prompt_{token}. "
+            f"Sentinel string for idempotence is 'mandatory_rules_{token}'. "
+            f"Verified by smoke_test_{token} in tests/contract."
+        )
+
+        add_with_batch_provenance(
+            memory_instance,
+            [{"role": "user", "content": text}],
+            user_id="prov-e2e-user",
+            run_id=run_id,
+            enable_graph=True,
+        )
+
+        # Whatever extraction did — we don't assert on its quality, only that
+        # cleanup is deterministic. Fetch the actual count first.
+        nodes_after_add = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid}) RETURN count(n) AS cnt",
+            params={"rid": run_id},
+        )[0]["cnt"]
+        # If extraction produced nothing (Haiku skipped on this abstract input),
+        # the test trivially holds. We still need at least the orphan-from-birth
+        # path to have cleaned up, which is also a passing outcome.
+        if nodes_after_add == 0:
+            pytest.skip(
+                f"Abstract text produced no graph extraction this run. "
+                f"Re-run when extraction is more aggressive."
+            )
+
+        # Delete every memory in scope. Use safe_bulk_delete equivalent —
+        # iterate vector memories carrying our run_id and delete each.
+        result = memory_instance.vector_store.list(
+            filters={"run_id": run_id}, limit=100
+        )
+        points = result[0] if isinstance(result, tuple) else result
+        memory_ids = [p.id for p in points]
+        for mid in memory_ids:
+            delete_memory_with_batch(
+                memory_instance, mid, enable_graph=True
+            )
+
+        # Hard contract: graph in scope is empty after all batch memories
+        # delete, no matter what nodes extraction generated.
+        rows = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid}) RETURN count(n) AS cnt, collect(n.name) AS leaked",
+            params={"rid": run_id},
+        )
+        cnt = rows[0]["cnt"]
+        leaked = rows[0]["leaked"]
+        assert cnt == 0, (
+            f"Provenance cleanup left {cnt} graph node(s) in scope after "
+            f"batch deletion. Leaked names: {leaked}. This is the failure "
+            f"mode the design exists to fix — re-extraction would have left "
+            f"these, batch_uuid hard-delete should not."
+        )
+
+    def test_shared_node_across_batches_keeps_per_batch_provenance(
+        self, memory_instance, isolated_scope
+    ):
+        """Two batches mention the same entity; the shared node carries both
+        batch_uuids. Deleting one batch must NOT delete the shared node —
+        the other batch still anchors it. Deleting both batches removes it.
+
+        This is the load-bearing test for codex's hole #1: edge `batch_uuid`
+        being a list (not scalar) so two batches can co-own a graph element.
+        """
+        from mem0_mcp_selfhosted.helpers import (
+            add_with_batch_provenance,
+            delete_memory_with_batch,
+        )
+
+        run_id = isolated_scope
+        # Same shared entity in both batches: a person + an org. Different
+        # secondary entities to keep batch identity distinct.
+        token = uuid.uuid4().hex[:6]
+        shared_org = f"sharedco_{token}"
+        shared_person = f"shareduser_{token}"
+
+        batch_1_text = (
+            f"{shared_person} is the founder of {shared_org}. "
+            f"{shared_org} runs the analytics service."
+        )
+        batch_2_text = (
+            f"{shared_person} also leads {shared_org}'s research team. "
+            f"{shared_org} acquired BetaCorp last quarter."
+        )
+
+        # Add both batches.
+        result1 = add_with_batch_provenance(
+            memory_instance,
+            [{"role": "user", "content": batch_1_text}],
+            user_id="prov-e2e-user",
+            run_id=run_id,
+            enable_graph=True,
+        )
+        result2 = add_with_batch_provenance(
+            memory_instance,
+            [{"role": "user", "content": batch_2_text}],
+            user_id="prov-e2e-user",
+            run_id=run_id,
+            enable_graph=True,
+        )
+
+        b1_ids = [m["id"] for m in result1.get("results", [])]
+        b2_ids = [m["id"] for m in result2.get("results", [])]
+        if not b1_ids or not b2_ids:
+            pytest.skip(
+                f"Both batches must produce memories; got "
+                f"b1={len(b1_ids)}, b2={len(b2_ids)}. Re-run."
+            )
+
+        # Read the shared org's batch_uuids — should have at least 2 distinct uuids
+        # if the LLM both batches' extraction produced an edge touching shared_org.
+        rows = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid, name: $name}) RETURN n.batch_uuids AS uids",
+            params={"rid": run_id, "name": shared_org},
+        )
+        if not rows or rows[0]["uids"] is None or len(rows[0]["uids"]) < 2:
+            pytest.skip(
+                f"Shared node {shared_org} did not accumulate >=2 batch_uuids; "
+                f"extraction may have skipped one batch. Got: {rows}"
+            )
+
+        # Delete only batch 1's memories. Shared node should survive.
+        for mid in b1_ids:
+            delete_memory_with_batch(
+                memory_instance, mid, enable_graph=True
+            )
+
+        rows = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid, name: $name}) RETURN n.batch_uuids AS uids",
+            params={"rid": run_id, "name": shared_org},
+        )
+        assert rows, (
+            f"Shared node {shared_org} was deleted after only batch 1's memories "
+            f"were removed. Batch 2 should still anchor it."
+        )
+        remaining_uids = rows[0]["uids"] or []
+        # batch 1's uuid should be gone, batch 2's uuid should still be present.
+        assert len(remaining_uids) >= 1, (
+            f"After batch 1 delete, shared node should still carry batch 2's uuid. "
+            f"Got: {remaining_uids}"
+        )
+
+        # Now delete batch 2. Shared node should disappear entirely.
+        for mid in b2_ids:
+            delete_memory_with_batch(
+                memory_instance, mid, enable_graph=True
+            )
+        rows = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid}) RETURN count(n) AS cnt",
+            params={"rid": run_id},
+        )
+        assert rows[0]["cnt"] == 0, (
+            f"After both batches deleted, scope must be fully clean. "
+            f"Got {rows[0]['cnt']} node(s) remaining."
+        )
