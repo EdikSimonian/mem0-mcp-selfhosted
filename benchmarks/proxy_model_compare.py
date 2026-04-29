@@ -1,7 +1,8 @@
 """Head-to-head benchmark across 5 LiteLLM-proxied models for mem0 extraction.
 
-Targets the actual production path: LiteLLM proxy (https://ai.simonian.online/v1)
-via OpenAI-compatible client, exercising mem0ai's real prompts and tool schemas.
+Targets the actual production path: a LiteLLM-compatible proxy (set
+BENCH_PROXY_BASE_URL) via OpenAI-compatible client, exercising mem0ai's real
+prompts and tool schemas.
 
 Vector path: FACT_RETRIEVAL_PROMPT (json_object response).
 Graph path:  EXTRACT_ENTITIES_TOOL → RELATIONS_TOOL with EXTRACT_RELATIONS_PROMPT,
@@ -40,9 +41,11 @@ import openai
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-PROXY_BASE_URL = "https://ai.simonian.online/v1"
+PROXY_BASE_URL = os.environ.get(
+    "BENCH_PROXY_BASE_URL", "https://your-litellm-proxy.example.com/v1"
+)
 KEYCHAIN_SERVICE = "mem0-mcp.openai-api-key"
-USER_ID = "eddie"
+USER_ID = "bench_user"
 RUN_ID = "bench"
 
 MODELS = [
@@ -72,14 +75,14 @@ CASES = [
     TestCase(
         name="family_pronoun",
         text=(
-            "Eddie's mom is Anoosh. Eddie's sister Elma is married to Raymond, "
-            "and their son is Sevada."
+            "Sam's mom is Pat. Sam's sister Riley is married to Casey, "
+            "and their son is Quinn."
         ),
         expected_edges=[
-            ("anoosh", "mother", "eddie"),
-            ("elma", "married", "raymond"),
-            ("sevada", "son", "elma"),
-            ("sevada", "son", "raymond"),
+            ("pat", "mother", "sam"),
+            ("riley", "married", "casey"),
+            ("quinn", "son", "riley"),
+            ("quinn", "son", "casey"),
         ],
         forbidden_entity_substrings=["run_id", "user_id"],
     ),
@@ -103,20 +106,20 @@ CASES = [
     TestCase(
         name="parenthetical_apposition",
         text=(
-            "Edmond (Eddie's brother) is married to Karolin, and they "
-            "have a daughter named Livia."
+            "Avery (Sam's brother) is married to Morgan, and they "
+            "have a daughter named Drew."
         ),
-        # Subject is Edmond. Eddie must NOT receive any spouse/parent edges.
+        # Subject is Avery. Sam must NOT receive any spouse/parent edges.
         expected_edges=[
-            ("edmond", "married", "karolin"),
-            ("edmond", "parent", "livia"),
-            ("karolin", "parent", "livia"),
-            ("edmond", "brother", "eddie"),
+            ("avery", "married", "morgan"),
+            ("avery", "parent", "drew"),
+            ("morgan", "parent", "drew"),
+            ("avery", "brother", "sam"),
         ],
         forbidden_edges=[
-            ("eddie", "married", "karolin"),
-            ("eddie", "parent", "livia"),
-            ("karolin", "married", "eddie"),
+            ("sam", "married", "morgan"),
+            ("sam", "parent", "drew"),
+            ("morgan", "married", "sam"),
         ],
     ),
 ]

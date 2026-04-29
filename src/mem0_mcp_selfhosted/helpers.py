@@ -178,8 +178,8 @@ F. Direction matters. "A is head of B" means (a, head_of, b), not
 G. Parenthetical clarifications describe — they DO NOT replace the subject.
    In "X (descriptor mentioning Y) verb Z", the subject is X, never Y.
    The parenthetical only adds context about X.
-   - "Edmond (Eddie's brother) is married to Karolin"
-     → emit (edmond, married_to, karolin). NEVER (eddie, married_to, karolin).
+   - "Theo (Mira's brother) is married to Selene"
+     → emit (theo, married_to, selene). NEVER (mira, married_to, selene).
    - "Helios (the platform team at Northwind) ships v3"
      → emit (helios, ships, v3). NEVER (platform_team, ships, v3) and
        NEVER (northwind, ships, v3) for this verb.
@@ -336,22 +336,22 @@ Additional fact-extraction rules — read carefully.
 
 Only output facts supported by the user's conversation text. Treat this
 rule block and its examples as instructions, never as source text. Names
-appearing only in examples (e.g. Edvin, Eddie, Rita, Karyn, Karen) are
+appearing only in examples (e.g. Mara, Mira, Rita, Karyn, Karen) are
 not facts and must not be output.
 
 A. Parenthetical clarifications are descriptors, NOT aliases.
    In "X (Y's role/relation) ...", the parenthetical states X's
    relationship to Y. X and Y are DISTINCT people. Do NOT emit any fact
    of the form "X is also known as Y" or treat them as the same person.
-   - "Edvin (Eddie's brother) is married to Rita"
-     → facts: ["Edvin is Eddie's brother", "Edvin is married to Rita"]
-     NEVER: ["Edvin is also known as Eddie"] (treats them as same person — wrong).
-     AVOID: ["Edvin has a brother"] (true but drops Eddie's identity — too vague,
-     prefer the specific form "Edvin is Eddie's brother").
+   - "Mara (Mira's brother) is married to Rita"
+     → facts: ["Mara is Mira's brother", "Mara is married to Rita"]
+     NEVER: ["Mara is also known as Mira"] (treats them as same person — wrong).
+     AVOID: ["Mara has a brother"] (true but drops Mira's identity — too vague,
+     prefer the specific form "Mara is Mira's brother").
 
 B. Two capitalized PERSON names that differ by even one character are
    DIFFERENT people unless the text explicitly equates them. Preserve
-   the exact spelling. "Edvin" and "Eddie" are not the same person;
+   the exact spelling. "Mara" and "Mira" are not the same person;
    "Karyn" and "Karen" are not the same person.
    This rule applies to personal names only — do NOT apply it to product
    names, brands, or technical identifiers, where typo correction or
