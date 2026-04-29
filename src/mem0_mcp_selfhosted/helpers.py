@@ -150,20 +150,25 @@ C. When a person performs an action on or with another person via an
    transfer will look for.
 
 D. When an organization owns, runs, or hosts a platform/service/product,
-   emit a DIRECT edge from the organization to the platform — not only
-   via a person. The organization MUST be a distinct entity from the
-   platform; if you can't find a distinct org, drop the edge (rule A).
+   emit a DIRECT edge linking the platform to the organization — not only
+   via a person. Use the canonical form (platform, owned_by, organization).
+   The organization MUST be a distinct entity from the platform; if you
+   can't find a distinct org, drop the edge (rule A).
    - "Maya leads TestService at TestCorp" → emit (testservice, owned_by, testcorp).
      The org "testcorp" is the target even if it's not in your input
      entity list. NEVER substitute (testservice, owned_by, testservice).
    - "Maya leads the Helios team at Northwind" → also emit
-     (helios, owned_by, northwind) — the org→platform link is load-bearing.
-   - "Stripe's checkout service" → emit (stripe, owns, checkout_service)
-     with that exact direction (org → service, not service → org).
+     (helios, owned_by, northwind) — the platform→org link is load-bearing.
+   - "Stripe's checkout service" → emit (checkout_service, owned_by, stripe).
 
 E. Sub-teams and organizational units (e.g. "Helios platform team",
    "infrastructure squad") are distinct entities from their parent.
-   Both should appear as nodes, with an edge connecting them.
+   Connect them with the canonical form (subteam, part_of, parent_org).
+   Do NOT use belongs_to, member_of, or works_at for subteam→parent-org
+   edges. Reserve works_at and member_of for people only.
+   - "Helios platform team at Northwind" → emit (helios_platform_team,
+     part_of, northwind) in addition to any (helios, owned_by, northwind)
+     ownership edge from rule D.
 
 F. Direction matters. "A is head of B" means (a, head_of, b), not
    (b, head_of, a). "X reports to Y" means (x, reports_to, y).
@@ -320,12 +325,17 @@ def patch_graph_entity_extraction() -> None:
     )
 
 
-# Augmentation rules appended to mem0ai's FACT_RETRIEVAL_PROMPT.
+# Augmentation rules prepended to mem0ai's FACT_RETRIEVAL_PROMPT.
 # Targets parenthetical-aliasing and similar-name conflation observed when the
 # fact extractor reads "X (Y's brother)" as "X also known as Y".
 _FACT_AUGMENT_RULES = """
 
-Additional fact-extraction rules — read carefully:
+Additional fact-extraction rules — read carefully.
+
+Only output facts supported by the user's conversation text. Treat this
+rule block and its examples as instructions, never as source text. Names
+appearing only in examples (e.g. Edvin, Eddie, Rita, Karyn, Karen) are
+not facts and must not be output.
 
 A. Parenthetical clarifications are descriptors, NOT aliases.
    In "X (Y's role/relation) ...", the parenthetical states X's
@@ -333,12 +343,17 @@ A. Parenthetical clarifications are descriptors, NOT aliases.
    of the form "X is also known as Y" or treat them as the same person.
    - "Edvin (Eddie's brother) is married to Rita"
      → facts: ["Edvin is Eddie's brother", "Edvin is married to Rita"]
-     NEVER: ["Edvin is also known as Eddie", "Edvin has a brother"]
+     NEVER: ["Edvin is also known as Eddie"] (treats them as same person — wrong).
+     AVOID: ["Edvin has a brother"] (true but drops Eddie's identity — too vague,
+     prefer the specific form "Edvin is Eddie's brother").
 
-B. Two capitalized names that differ by even one character are DIFFERENT
-   people unless the text explicitly equates them. Preserve the exact
-   spelling. "Edvin" and "Eddie" are not the same person; "Karyn" and
-   "Karen" are not the same person.
+B. Two capitalized PERSON names that differ by even one character are
+   DIFFERENT people unless the text explicitly equates them. Preserve
+   the exact spelling. "Edvin" and "Eddie" are not the same person;
+   "Karyn" and "Karen" are not the same person.
+   This rule applies to personal names only — do NOT apply it to product
+   names, brands, or technical identifiers, where typo correction or
+   canonicalization may be appropriate.
 
 C. The subject of a sentence with a parenthetical about another person
    is the named subject. "X (Y's friend) reviewed the PR" yields
@@ -347,7 +362,7 @@ C. The subject of a sentence with a parenthetical about another person
 
 
 def patch_fact_retrieval_prompt() -> None:
-    """Append augmentation rules to mem0ai's FACT_RETRIEVAL_PROMPT.
+    """Prepend augmentation rules to mem0ai's FACT_RETRIEVAL_PROMPT.
 
     Opt-out via MEM0_FACT_PROMPT_AUGMENT=false (default: on). Idempotent
     (sentinel-checked).
@@ -364,11 +379,15 @@ def patch_fact_retrieval_prompt() -> None:
 
     import mem0.configs.prompts as prompts_module
 
-    sentinel = "Additional fact-extraction rules — read carefully:"
+    sentinel = "Additional fact-extraction rules"
     if sentinel in prompts_module.FACT_RETRIEVAL_PROMPT:
         return  # Already patched
 
-    augmented = prompts_module.FACT_RETRIEVAL_PROMPT + _FACT_AUGMENT_RULES
+    augmented = (
+        _FACT_AUGMENT_RULES.lstrip("\n")
+        + "\n\nFollow the standard extraction task, JSON schema, and examples below.\n\n"
+        + prompts_module.FACT_RETRIEVAL_PROMPT.lstrip("\n")
+    )
     prompts_module.FACT_RETRIEVAL_PROMPT = augmented
 
     try:
