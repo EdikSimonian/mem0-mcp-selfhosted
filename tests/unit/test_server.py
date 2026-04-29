@@ -172,20 +172,33 @@ class TestDeleteMemory:
         parsed = json.loads(result)
         assert parsed["message"] == "Memory deleted successfully!"
 
-    @patch("mem0_mcp_selfhosted.server.call_with_graph")
-    def test_routes_through_call_with_graph(self, mock_cwg, server_with_mock):
-        """delete_memory must route through call_with_graph so mem.enable_graph
-        is set deterministically per request. Without this, graph cleanup is
-        racy — mem.enable_graph is whatever the last unrelated call left it at,
-        and Memory.delete() conditionally cleans Neo4j based on that flag."""
-        mock_cwg.return_value = None
+    @patch("mem0_mcp_selfhosted.server.delete_memory_with_batch")
+    def test_routes_through_delete_memory_with_batch(self, mock_dmwb, server_with_mock):
+        """delete_memory must route through delete_memory_with_batch so the
+        per-call enable_graph value is set deterministically and batch_uuid
+        cleanup runs under the same lock as mem.delete. Bypassing this helper
+        would re-introduce the race where mem.enable_graph is whatever the
+        last unrelated call left it at."""
+        mock_dmwb.return_value = {"message": "Memory deleted successfully!"}
         srv, mem = server_with_mock
         fn = _get_tool_fn(srv, "delete_memory")
         fn(memory_id="uuid-123", enable_graph=True)
-        args, _ = mock_cwg.call_args
+        # Helper called with (memory, memory_id) positionally + enable_graph kwarg.
+        args, kwargs = mock_dmwb.call_args
         assert args[0] is mem
-        assert args[1] is True  # enable_graph from caller
-        assert args[2] is False  # _enable_graph_default from fixture
+        assert args[1] == "uuid-123"
+        assert kwargs["enable_graph"] is True
+
+    @patch("mem0_mcp_selfhosted.server.delete_memory_with_batch")
+    def test_uses_default_when_enable_graph_unset(self, mock_dmwb, server_with_mock):
+        """When the caller omits enable_graph, the server's own default
+        (_enable_graph_default) must reach delete_memory_with_batch."""
+        mock_dmwb.return_value = {"message": "Memory deleted successfully!"}
+        srv, _ = server_with_mock  # fixture sets _enable_graph_default = False
+        fn = _get_tool_fn(srv, "delete_memory")
+        fn(memory_id="uuid-123")
+        _, kwargs = mock_dmwb.call_args
+        assert kwargs["enable_graph"] is False
 
 
 class TestDeleteAllMemories:

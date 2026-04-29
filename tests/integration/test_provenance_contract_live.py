@@ -193,3 +193,139 @@ class TestGraphTimestampBehavior:
             f"(was {ua1}, became {ua2}). Without this, Pass A's "
             f"`r.updated_at >= $start_ts` filter cannot find re-merged edges."
         )
+
+
+class TestBatchProvenanceEndToEnd:
+    """Full add → tag → delete → hard-delete round trip via the new helpers.
+
+    These exercise the failure mode that motivated the whole design: text
+    mentioning code identifiers that mem0ai's re-extraction-based delete
+    cascade silently fails on. Provenance tagging makes the cleanup
+    deterministic regardless of extraction drift.
+    """
+
+    @pytest.fixture
+    def isolated_scope(self, memory_instance, neo4j_available):
+        if memory_instance.graph is None:
+            pytest.skip("Graph backend not initialized on memory_instance")
+        run_id = f"prov-e2e-{uuid.uuid4()}"
+        yield run_id
+        # Belt-and-suspenders cleanup: detach-delete any leftover scoped nodes.
+        try:
+            memory_instance.graph.graph.query(
+                "MATCH (n {run_id: $rid}) DETACH DELETE n",
+                params={"rid": run_id},
+            )
+        except Exception:
+            pass
+
+    def test_add_then_delete_clears_graph_for_single_memory_batch(
+        self, memory_instance, isolated_scope
+    ):
+        """Single memory in a batch: deleting it must clear the whole graph
+        batch deterministically — not via re-extraction."""
+        from mem0_mcp_selfhosted.helpers import (
+            add_with_batch_provenance,
+            delete_memory_with_batch,
+        )
+
+        run_id = isolated_scope
+        text = (
+            f"ProvenanceProbe: BluePort runs in Trantor cloud-region-{uuid.uuid4().hex[:6]}. "
+            f"Anya leads BluePort at Trantor."
+        )
+
+        add_result = add_with_batch_provenance(
+            memory_instance,
+            [{"role": "user", "content": text}],
+            user_id="prov-e2e-user",
+            run_id=run_id,
+            enable_graph=True,
+        )
+        memory_ids = [m["id"] for m in add_result.get("results", [])]
+        assert memory_ids, f"Expected at least one memory; got {add_result!r}"
+
+        # Sanity: graph picked up at least one tagged node in our scope.
+        rows = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid}) RETURN count(n) AS cnt",
+            params={"rid": run_id},
+        )
+        assert rows[0]["cnt"] > 0, "no graph nodes created — extraction skipped?"
+
+        # Delete every memory in the batch.
+        for mid in memory_ids:
+            delete_memory_with_batch(
+                memory_instance, mid, enable_graph=True
+            )
+
+        # Graph must be fully clean for this scope after the LAST memory's delete.
+        rows = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid}) RETURN count(n) AS cnt",
+            params={"rid": run_id},
+        )
+        assert rows[0]["cnt"] == 0, (
+            f"Provenance cleanup left {rows[0]['cnt']} graph nodes in scope "
+            f"after all batch memories deleted. Re-extraction would leak; "
+            f"batch_uuid hard-delete should not."
+        )
+
+    def test_partial_batch_delete_preserves_remaining(
+        self, memory_instance, isolated_scope
+    ):
+        """Multi-memory batch: deleting only ONE memory must NOT collapse the
+        graph — other memories from the same batch still anchor it."""
+        from mem0_mcp_selfhosted.helpers import (
+            add_with_batch_provenance,
+            delete_memory_with_batch,
+        )
+
+        run_id = isolated_scope
+        text = (
+            f"ProvenanceProbe2: BluePort runs in Trantor cloud-region-{uuid.uuid4().hex[:6]}. "
+            f"Anya leads BluePort at Trantor."
+        )
+
+        add_result = add_with_batch_provenance(
+            memory_instance,
+            [{"role": "user", "content": text}],
+            user_id="prov-e2e-user",
+            run_id=run_id,
+            enable_graph=True,
+        )
+        memory_ids = [m["id"] for m in add_result.get("results", [])]
+        if len(memory_ids) < 2:
+            pytest.skip(
+                f"Extraction produced only {len(memory_ids)} fact(s); test "
+                "needs >=2 memories in one batch. Re-run when LLM extracts more."
+            )
+
+        graph_before = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid}) RETURN count(n) AS cnt",
+            params={"rid": run_id},
+        )[0]["cnt"]
+        assert graph_before > 0
+
+        # Delete just the first memory.
+        delete_memory_with_batch(
+            memory_instance, memory_ids[0], enable_graph=True
+        )
+
+        graph_after = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid}) RETURN count(n) AS cnt",
+            params={"rid": run_id},
+        )[0]["cnt"]
+        assert graph_after == graph_before, (
+            f"Partial batch delete should preserve graph (other memories "
+            f"still anchor it). Got {graph_after}, expected {graph_before}."
+        )
+
+        # Now delete the rest — graph should fully clear.
+        for mid in memory_ids[1:]:
+            delete_memory_with_batch(
+                memory_instance, mid, enable_graph=True
+            )
+        rows = memory_instance.graph.graph.query(
+            "MATCH (n {run_id: $rid}) RETURN count(n) AS cnt",
+            params={"rid": run_id},
+        )
+        assert rows[0]["cnt"] == 0

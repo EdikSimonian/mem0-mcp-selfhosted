@@ -912,20 +912,30 @@ def count_batch_anchors(
     memory: Any,
     *,
     batch_uuid: str,
-    user_id: str,
-    agent_id: str | None,
-    run_id: str | None,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    run_id: str | None = None,
 ) -> int:
-    """Count vector memories carrying this batch_uuid in the same scope.
+    """Count vector memories carrying this batch_uuid in the given scope.
 
     Used post-add to detect orphan-from-birth (no anchor → reclaim graph),
-    and pre-delete to decide whether the graph batch can be reclaimed.
+    and pre-delete to decide whether the graph batch can be reclaimed. At
+    least one scope key (user_id / agent_id / run_id) must be passed; without
+    one, the count would scan all memories in the collection regardless of
+    user, which is both wrong and a privacy leak.
     """
-    filters: dict[str, Any] = {"user_id": user_id, "batch_uuid": batch_uuid}
+    filters: dict[str, Any] = {"batch_uuid": batch_uuid}
+    if user_id:
+        filters["user_id"] = user_id
     if agent_id:
         filters["agent_id"] = agent_id
     if run_id:
         filters["run_id"] = run_id
+    if not (user_id or agent_id or run_id):
+        raise ValueError(
+            "count_batch_anchors requires at least one scope key "
+            "(user_id, agent_id, or run_id)"
+        )
 
     # 100 is plenty: a single add_memory call produces at most a handful of
     # facts (typically 1-5). If we ever produce >100 in one batch, scope filters
@@ -1048,3 +1058,104 @@ def add_with_batch_provenance(
             )
 
         return result
+
+
+def delete_memory_with_batch(
+    memory: Any,
+    memory_id: str,
+    *,
+    enable_graph: bool,
+) -> dict:
+    """Delete a memory with batch-UUID-aware graph cleanup.
+
+    If the memory carries a batch_uuid in its payload (set by
+    add_with_batch_provenance), bypass mem0ai's re-extraction-based cascade
+    entirely: temporarily flip enable_graph=False around mem.delete(), then
+    hard-delete graph elements tagged with that batch_uuid IFF no other vector
+    memory in the same scope still references the batch.
+
+    For memories without a batch_uuid (added before the rollout, or with
+    enable_graph=False at add time), falls through to the legacy path:
+    mem.delete() runs the re-extraction cascade, then gc_orphan_graph_nodes
+    sweeps any orphans the soft-delete left behind.
+
+    Defense-in-depth: if the Qdrant scroll for anchor counting fails, leave
+    the tagged graph in place and log loudly. We never hard-delete on a
+    partial failure — operator can re-run cleanup via safe_bulk_delete.
+    """
+    if memory is None:
+        raise RuntimeError("Memory not initialized.")
+
+    # Read payload BEFORE delete — we need batch_uuid + scope intact.
+    try:
+        existing = memory.vector_store.get(vector_id=memory_id)
+        payload = getattr(existing, "payload", None) or {}
+    except Exception as exc:
+        logger.warning(
+            "Could not read payload for memory %s: %s — falling through to "
+            "legacy delete path",
+            memory_id,
+            exc,
+        )
+        payload = {}
+
+    batch_uuid = payload.get("batch_uuid")
+    scope: dict[str, Any] = {}
+    for key in ("user_id", "agent_id", "run_id"):
+        val = payload.get(key)
+        if val:
+            scope[key] = val
+
+    use_legacy_path = (
+        batch_uuid is None
+        or memory.graph is None
+        or not enable_graph
+    )
+
+    with _graph_lock:
+        if use_legacy_path:
+            memory.enable_graph = enable_graph and memory.graph is not None
+            memory.delete(memory_id)
+            if memory.enable_graph and scope.get("user_id"):
+                gc_orphan_graph_nodes(memory, scope)
+            return {"message": "Memory deleted successfully!"}
+
+        # Batch-UUID path: bypass re-extraction cascade.
+        prev_enable = memory.enable_graph
+        memory.enable_graph = False
+        try:
+            memory.delete(memory_id)
+        finally:
+            memory.enable_graph = prev_enable
+
+        # Count remaining memories with this batch_uuid in the same scope.
+        try:
+            anchors = count_batch_anchors(
+                memory,
+                batch_uuid=batch_uuid,
+                user_id=scope.get("user_id"),
+                agent_id=scope.get("agent_id"),
+                run_id=scope.get("run_id"),
+            )
+        except Exception as exc:
+            logger.error(
+                "Qdrant scroll failed for batch %s during delete (memory=%s): "
+                "%s. Leaving tagged graph elements in place; manual cleanup "
+                "may be needed.",
+                batch_uuid,
+                memory_id,
+                exc,
+            )
+            return {"message": "Memory deleted successfully!"}
+
+        if anchors == 0:
+            try:
+                hard_delete_batch(memory, batch_uuid)
+            except Exception as exc:
+                logger.error(
+                    "Hard-delete failed for batch %s after vector delete: %s",
+                    batch_uuid,
+                    exc,
+                )
+
+        return {"message": "Memory deleted successfully!"}

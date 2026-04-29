@@ -28,7 +28,7 @@ from mem0_mcp_selfhosted.helpers import (
     _mem0_call,
     add_with_batch_provenance,
     call_with_graph,
-    gc_orphan_graph_nodes,
+    delete_memory_with_batch,
     get_default_user_id,
     list_entities_facet,
     patch_extract_relations_prompt,
@@ -420,49 +420,14 @@ def _register_tools(mcp: FastMCP) -> None:
             enable_graph if enable_graph is not None else _enable_graph_default
         )
 
-        def _do_delete():
-            # Capture the memory's scope before delete so the orphan GC
-            # can run a same-scope DETACH DELETE pass after mem0ai's
-            # cascade soft-deletes incident edges.
-            scope: dict[str, Any] = {}
-            if graph_enabled and mem.graph is not None:
-                try:
-                    existing = mem.vector_store.get(vector_id=memory_id)
-                    payload = getattr(existing, "payload", None) or {}
-                    for key in ("user_id", "agent_id", "run_id"):
-                        val = payload.get(key)
-                        if val:
-                            scope[key] = val
-                except Exception as exc:
-                    logger.warning(
-                        "Could not read scope for memory %s before delete: %s",
-                        memory_id,
-                        exc,
-                    )
-
-            gc_debug = bool_env("MEM0_GC_DEBUG")
-
-            if gc_debug:
-                with open("/tmp/gc-debug.log", "a") as _dbg:
-                    _dbg.write(
-                        f"[do_delete] memory_id={memory_id} graph_enabled={graph_enabled} scope={scope}\n"
-                    )
-
-            mem.delete(memory_id)
-
-            if gc_debug:
-                with open("/tmp/gc-debug.log", "a") as _dbg:
-                    _dbg.write(
-                        f"[do_delete] mem.delete returned; will_call_gc={graph_enabled and bool(scope.get('user_id'))}\n"
-                    )
-
-            if graph_enabled and scope.get("user_id"):
-                gc_orphan_graph_nodes(mem, scope)
-
-            return {"message": "Memory deleted successfully!"}
-
+        # delete_memory_with_batch internally handles _graph_lock, payload
+        # read, batch_uuid dispatch, and the legacy gc_orphan fallback for
+        # memories added before provenance tagging shipped.
         return _mem0_call(
-            call_with_graph, mem, enable_graph, _enable_graph_default, _do_delete
+            delete_memory_with_batch,
+            mem,
+            memory_id,
+            enable_graph=graph_enabled,
         )
 
     @mcp.tool()

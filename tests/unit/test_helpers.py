@@ -849,3 +849,125 @@ class TestAddWithBatchProvenance:
         # mem.add was still called; result returned.
         assert memory.add.called
         assert result["results"][0]["id"] == "mid"
+
+
+class TestDeleteMemoryWithBatch:
+    """End-to-end orchestration of the delete-side cleanup."""
+
+    def _make_memory(self, *, payload=None, graph=True, anchors=0):
+        """Build a Memory mock for delete tests."""
+        memory = MagicMock()
+        memory.graph = MagicMock() if graph else None
+        memory.vector_store.get.return_value.payload = payload if payload is not None else {}
+        memory.vector_store.list.return_value = (
+            [MagicMock() for _ in range(anchors)],
+            None,
+        )
+        return memory
+
+    def test_legacy_path_when_no_batch_uuid(self):
+        """Memories without batch_uuid (added before rollout) use the legacy
+        cascade + gc_orphan path via mem.delete()."""
+        memory = self._make_memory(payload={"user_id": "alice"})
+        with patch("mem0_mcp_selfhosted.helpers.gc_orphan_graph_nodes") as mock_gc:
+            from mem0_mcp_selfhosted.helpers import delete_memory_with_batch
+
+            result = delete_memory_with_batch(memory, "mid", enable_graph=True)
+        assert result == {"message": "Memory deleted successfully!"}
+        memory.delete.assert_called_once_with("mid")
+        # Legacy path: enable_graph set True, gc_orphan_graph_nodes called
+        # because graph was active and scope had user_id.
+        assert memory.enable_graph is True
+        mock_gc.assert_called_once_with(memory, {"user_id": "alice"})
+
+    def test_legacy_path_when_graph_disabled(self):
+        """When caller passes enable_graph=False, legacy path runs (no batch
+        cleanup, no gc_orphan)."""
+        memory = self._make_memory(payload={"user_id": "alice", "batch_uuid": "b1"})
+        with patch("mem0_mcp_selfhosted.helpers.gc_orphan_graph_nodes") as mock_gc:
+            from mem0_mcp_selfhosted.helpers import delete_memory_with_batch
+
+            delete_memory_with_batch(memory, "mid", enable_graph=False)
+        assert memory.enable_graph is False
+        memory.delete.assert_called_once_with("mid")
+        mock_gc.assert_not_called()
+
+    def test_batch_path_bypasses_re_extraction(self):
+        """When batch_uuid is present, mem.enable_graph is False during
+        mem.delete() — that bypasses mem0ai's re-extraction cascade."""
+        memory = self._make_memory(
+            payload={"user_id": "alice", "batch_uuid": "b1"}, anchors=0
+        )
+        # Hard-delete inside the helper hits Cypher; stub it.
+        memory.graph.graph.query.side_effect = [
+            [{"deleted": 2}],  # hard_delete relations
+            [{"deleted": 1}],  # hard_delete nodes
+        ]
+        # Capture enable_graph value at the moment mem.delete runs.
+        captured = {}
+
+        def _capture_delete(_memory_id):
+            captured["enable_graph_during_delete"] = memory.enable_graph
+
+        memory.delete.side_effect = _capture_delete
+        memory.enable_graph = True  # prior request left it True
+
+        from mem0_mcp_selfhosted.helpers import delete_memory_with_batch
+
+        delete_memory_with_batch(memory, "mid", enable_graph=True)
+
+        # During mem.delete, enable_graph must have been False.
+        assert captured["enable_graph_during_delete"] is False
+        # After return, we restored to the prior value.
+        assert memory.enable_graph is True
+
+    def test_hard_deletes_only_when_no_anchors_remain(self):
+        """If other vector memories still carry the batch_uuid in scope,
+        the graph batch must NOT be hard-deleted."""
+        memory = self._make_memory(
+            payload={"user_id": "alice", "batch_uuid": "b1"}, anchors=3
+        )
+        from mem0_mcp_selfhosted.helpers import delete_memory_with_batch
+
+        delete_memory_with_batch(memory, "mid", enable_graph=True)
+        # mem.delete ran, but no Cypher hard-delete (graph.query wasn't called).
+        memory.delete.assert_called_once_with("mid")
+        memory.graph.graph.query.assert_not_called()
+
+    def test_qdrant_scroll_failure_leaves_graph_intact(self):
+        """If the anchor count fails (Qdrant down mid-flow), we never
+        hard-delete on partial state — the tagged graph stays as-is."""
+        memory = self._make_memory(
+            payload={"user_id": "alice", "batch_uuid": "b1"}
+        )
+        memory.vector_store.list.side_effect = RuntimeError("Qdrant down")
+
+        from mem0_mcp_selfhosted.helpers import delete_memory_with_batch
+
+        result = delete_memory_with_batch(memory, "mid", enable_graph=True)
+        # Vector delete still happened.
+        memory.delete.assert_called_once_with("mid")
+        # No hard-delete attempted.
+        memory.graph.graph.query.assert_not_called()
+        # Caller still gets a success message — vector store IS clean.
+        assert result == {"message": "Memory deleted successfully!"}
+
+    def test_payload_read_failure_falls_through_to_legacy(self):
+        """If we can't read the memory's payload at all, fall through to the
+        legacy mem.delete() path with no batch dispatch."""
+        memory = self._make_memory(graph=True)
+        memory.vector_store.get.side_effect = RuntimeError("payload missing")
+
+        with patch("mem0_mcp_selfhosted.helpers.gc_orphan_graph_nodes") as mock_gc:
+            from mem0_mcp_selfhosted.helpers import delete_memory_with_batch
+
+            delete_memory_with_batch(memory, "mid", enable_graph=True)
+        memory.delete.assert_called_once_with("mid")
+        # No scope captured → gc_orphan not called.
+        mock_gc.assert_not_called()
+
+    def test_raises_when_memory_is_none(self):
+        from mem0_mcp_selfhosted.helpers import delete_memory_with_batch
+
+        with pytest.raises(RuntimeError, match="Memory not initialized"):
+            delete_memory_with_batch(None, "mid", enable_graph=True)
