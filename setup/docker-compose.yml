@@ -9,14 +9,18 @@ services:
       - "${QDRANT_REST_PORT:-6333}:6333"
       - "${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
-      - ${MEM0_DATA_DIR:?MEM0_DATA_DIR must be set in .env (absolute path, e.g. /Users/you/.mem0-stack)}/qdrant/storage:/qdrant/storage
-      - ${MEM0_DATA_DIR}/qdrant/snapshots:/qdrant/snapshots
+      - qdrant_storage:/qdrant/storage
+      - ${MEM0_DATA_DIR:?MEM0_DATA_DIR must be set in .env (absolute path, e.g. /Users/you/.mem0-stack)}/qdrant/snapshots:/qdrant/snapshots
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && read -t 3 line <&3 && [[ "$$line" == *200* ]]'
       interval: 10s
-      timeout: 3s
-      retries: 10
-      start_period: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   neo4j:
     image: neo4j:5.26-community
@@ -36,13 +40,19 @@ services:
       NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-2G}
       NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
     volumes:
-      - ${MEM0_DATA_DIR}/neo4j/data:/data
-      - ${MEM0_DATA_DIR}/neo4j/logs:/logs
+      - neo4j_data:/data
+      - neo4j_logs:/logs
       - ${MEM0_DATA_DIR}/neo4j/import:/var/lib/neo4j/import
-      - ${MEM0_DATA_DIR}/neo4j/plugins:/plugins
+      - neo4j_plugins:/plugins
     healthcheck:
       test: ["CMD-SHELL", "cypher-shell -u $${NEO4J_USER:-neo4j} -p $$(echo $$NEO4J_AUTH | cut -d/ -f2) 'RETURN 1' || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 10
       start_period: 45s
+
+volumes:
+  qdrant_storage:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_plugins:
