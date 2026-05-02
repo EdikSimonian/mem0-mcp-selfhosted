@@ -19,19 +19,23 @@ from mem0.utils.factory import LlmFactory
 logger = logging.getLogger(__name__)
 
 # Tool names that indicate extraction pipeline stages (Calls 1 & 2)
-_EXTRACTION_TOOLS = frozenset({
-    "extract_entities",
-    "establish_relationships",
-    "establish_relations",
-})
+_EXTRACTION_TOOLS = frozenset(
+    {
+        "extract_entities",
+        "establish_relationships",
+        "establish_relations",
+    }
+)
 
 # Tool names that indicate contradiction detection stage (Call 3)
-_CONTRADICTION_TOOLS = frozenset({
-    "delete_graph_memory",
-    "update_graph_memory",
-    "add_graph_memory",
-    "noop",
-})
+_CONTRADICTION_TOOLS = frozenset(
+    {
+        "delete_graph_memory",
+        "update_graph_memory",
+        "add_graph_memory",
+        "noop",
+    }
+)
 
 
 class SplitModelGraphLLMConfig(BaseLlmConfig):
@@ -47,7 +51,7 @@ class SplitModelGraphLLMConfig(BaseLlmConfig):
         extraction_model: str = "gemini-2.5-flash-lite",
         extraction_api_key: str | None = None,
         contradiction_provider: str = "anthropic",
-        contradiction_model: str = "claude-opus-4-6",
+        contradiction_model: str = "claude-sonnet-4-6",
         contradiction_api_key: str | None = None,
         contradiction_max_tokens: int = 16384,
         contradiction_ollama_base_url: str | None = None,
@@ -99,7 +103,9 @@ class SplitModelGraphLLM(LLMBase):
         if self.config.contradiction_api_key:
             contradiction_config["api_key"] = self.config.contradiction_api_key
         if self.config.contradiction_ollama_base_url:
-            contradiction_config["ollama_base_url"] = self.config.contradiction_ollama_base_url
+            contradiction_config["ollama_base_url"] = (
+                self.config.contradiction_ollama_base_url
+            )
 
         self.extraction_llm = LlmFactory.create(
             self.config.extraction_provider, extraction_config

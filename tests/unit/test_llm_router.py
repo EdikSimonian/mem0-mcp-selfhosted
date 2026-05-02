@@ -21,7 +21,9 @@ def _make_tool(name: str) -> dict:
 
 EXTRACTION_RESPONSE = {
     "content": None,
-    "tool_calls": [{"name": "extract_entities", "arguments": {"entities": [{"name": "Alice"}]}}],
+    "tool_calls": [
+        {"name": "extract_entities", "arguments": {"entities": [{"name": "Alice"}]}}
+    ],
 }
 
 CONTRADICTION_RESPONSE = {
@@ -51,13 +53,16 @@ class TestSplitModelGraphLLM:
 
             mock_factory.create.side_effect = create_side_effect
 
-            from mem0_mcp_selfhosted.llm_router import SplitModelGraphLLM, SplitModelGraphLLMConfig
+            from mem0_mcp_selfhosted.llm_router import (
+                SplitModelGraphLLM,
+                SplitModelGraphLLMConfig,
+            )
 
             config = SplitModelGraphLLMConfig(
                 extraction_provider="gemini",
                 extraction_model="gemini-2.5-flash-lite",
                 contradiction_provider="anthropic",
-                contradiction_model="claude-opus-4-6",
+                contradiction_model="claude-sonnet-4-6",
             )
             router = SplitModelGraphLLM(config)
             router._extraction_mock = extraction_llm
@@ -67,7 +72,9 @@ class TestSplitModelGraphLLM:
     def test_extract_entities_routes_to_extraction(self, router):
         """extract_entities tool routes to extraction LLM."""
         tools = [_make_tool("extract_entities")]
-        result = router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        result = router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         router._extraction_mock.generate_response.assert_called_once()
         router._contradiction_mock.generate_response.assert_not_called()
@@ -75,7 +82,9 @@ class TestSplitModelGraphLLM:
     def test_establish_relationships_routes_to_extraction(self, router):
         """establish_relationships tool routes to extraction LLM."""
         tools = [_make_tool("establish_relationships")]
-        router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         router._extraction_mock.generate_response.assert_called_once()
         router._contradiction_mock.generate_response.assert_not_called()
@@ -83,7 +92,9 @@ class TestSplitModelGraphLLM:
     def test_establish_relations_routes_to_extraction(self, router):
         """establish_relations (alternate name) routes to extraction LLM."""
         tools = [_make_tool("establish_relations")]
-        router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         router._extraction_mock.generate_response.assert_called_once()
         router._contradiction_mock.generate_response.assert_not_called()
@@ -91,7 +102,9 @@ class TestSplitModelGraphLLM:
     def test_delete_graph_memory_routes_to_contradiction(self, router):
         """delete_graph_memory tool routes to contradiction LLM."""
         tools = [_make_tool("delete_graph_memory")]
-        router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         router._contradiction_mock.generate_response.assert_called_once()
         router._extraction_mock.generate_response.assert_not_called()
@@ -99,7 +112,9 @@ class TestSplitModelGraphLLM:
     def test_update_graph_memory_routes_to_contradiction(self, router):
         """update_graph_memory tool routes to contradiction LLM."""
         tools = [_make_tool("update_graph_memory")]
-        router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         router._contradiction_mock.generate_response.assert_called_once()
         router._extraction_mock.generate_response.assert_not_called()
@@ -107,7 +122,9 @@ class TestSplitModelGraphLLM:
     def test_add_graph_memory_routes_to_contradiction(self, router):
         """add_graph_memory tool routes to contradiction LLM."""
         tools = [_make_tool("add_graph_memory")]
-        router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         router._contradiction_mock.generate_response.assert_called_once()
         router._extraction_mock.generate_response.assert_not_called()
@@ -115,7 +132,9 @@ class TestSplitModelGraphLLM:
     def test_noop_routes_to_contradiction(self, router):
         """noop tool routes to contradiction LLM."""
         tools = [_make_tool("noop")]
-        router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         router._contradiction_mock.generate_response.assert_called_once()
         router._extraction_mock.generate_response.assert_not_called()
@@ -130,7 +149,9 @@ class TestSplitModelGraphLLM:
     def test_unknown_tool_routes_to_extraction(self, router):
         """Unknown tool name defaults to extraction LLM."""
         tools = [_make_tool("some_unknown_tool")]
-        router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         router._extraction_mock.generate_response.assert_called_once()
         router._contradiction_mock.generate_response.assert_not_called()
@@ -138,13 +159,17 @@ class TestSplitModelGraphLLM:
     def test_response_passthrough_extraction(self, router):
         """Router returns exact response from extraction LLM."""
         tools = [_make_tool("extract_entities")]
-        result = router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        result = router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         assert result is EXTRACTION_RESPONSE
 
     def test_response_passthrough_contradiction(self, router):
         """Router returns exact response from contradiction LLM."""
         tools = [_make_tool("delete_graph_memory")]
-        result = router.generate_response(messages=[{"role": "user", "content": "test"}], tools=tools)
+        result = router.generate_response(
+            messages=[{"role": "user", "content": "test"}], tools=tools
+        )
 
         assert result is CONTRADICTION_RESPONSE

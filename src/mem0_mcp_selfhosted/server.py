@@ -36,6 +36,7 @@ from mem0_mcp_selfhosted.helpers import (
     patch_gemini_parse_response,
     patch_graph_entity_extraction,
     patch_graph_sanitizer,
+    patch_llm_config_validator,
     safe_bulk_delete,
 )
 
@@ -91,6 +92,10 @@ def _resolve_config_class(provider_name: str) -> type | None:
         from mem0_mcp_selfhosted.llm_anthropic import AnthropicOATConfig
 
         return AnthropicOATConfig
+    if provider_name == "claude_cli":
+        from mem0_mcp_selfhosted.llm_claude_cli import ClaudeCliConfig
+
+        return ClaudeCliConfig
     return None
 
 
@@ -103,6 +108,7 @@ def _init_memory() -> Any:
     register_providers(providers_info)
 
     # Patch mem0ai's relationship sanitizer + extraction prompts before Memory init
+    patch_llm_config_validator()
     patch_graph_sanitizer()
     patch_gemini_parse_response()
     patch_extract_relations_prompt()

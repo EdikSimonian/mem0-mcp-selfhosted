@@ -24,7 +24,9 @@ _BASE_ENV = {
 }
 
 
-def _make_env(llm_provider: str, graph_provider: str | None, enable_graph: bool) -> dict:
+def _make_env(
+    llm_provider: str, graph_provider: str | None, enable_graph: bool
+) -> dict:
     """Build env dict for a provider combination."""
     env = dict(_BASE_ENV)
     env["MEM0_LLM_PROVIDER"] = llm_provider
@@ -58,14 +60,24 @@ class TestProviderMatrix:
     )
     @patch("mem0_mcp_selfhosted.config.resolve_token", return_value="sk-ant-api-fake")
     def test_provider_combination(
-        self, mock_token, llm_provider, graph_provider, enable_graph, test_id, monkeypatch
+        self,
+        mock_token,
+        llm_provider,
+        graph_provider,
+        enable_graph,
+        test_id,
+        monkeypatch,
     ):
         env = _make_env(llm_provider, graph_provider, enable_graph)
         for k, v in env.items():
             monkeypatch.setenv(k, v)
         # Clean up env vars not in this combination
-        for key in ("MEM0_LLM_MODEL", "MEM0_GRAPH_LLM_MODEL", "MEM0_LLM_URL",
-                     "MEM0_GRAPH_LLM_URL"):
+        for key in (
+            "MEM0_LLM_MODEL",
+            "MEM0_GRAPH_LLM_MODEL",
+            "MEM0_LLM_URL",
+            "MEM0_GRAPH_LLM_URL",
+        ):
             monkeypatch.delenv(key, raising=False)
 
         config_dict, providers_info, split_config = build_config()
@@ -78,9 +90,8 @@ class TestProviderMatrix:
         # Provider info — always includes Ollama, plus Anthropic when applicable
         provider_names = [pi["name"] for pi in providers_info]
         assert "ollama" in provider_names  # Always registered
-        needs_anthropic = (
-            llm_provider == "anthropic"
-            or (enable_graph and graph_provider in ("anthropic", "anthropic_oat"))
+        needs_anthropic = llm_provider == "anthropic" or (
+            enable_graph and graph_provider in ("anthropic", "anthropic_oat")
         )
         if needs_anthropic:
             assert "anthropic" in provider_names
@@ -113,7 +124,7 @@ class TestDefaultModelAcrossMatrix:
     @pytest.mark.parametrize(
         "llm_provider,expected_model",
         [
-            ("anthropic", "claude-opus-4-6"),
+            ("anthropic", "claude-sonnet-4-6"),
             ("ollama", "qwen3:14b"),
         ],
     )

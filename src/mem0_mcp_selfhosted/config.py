@@ -45,7 +45,7 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
 
     # --- Top-level provider default (cascades to LLM and graph LLM) ---
     _provider_default = env("MEM0_PROVIDER", "anthropic")
-    _supported_llm_providers = ("anthropic", "ollama", "openai")
+    _supported_llm_providers = ("anthropic", "ollama", "openai", "claude_cli")
     if _provider_default not in _supported_llm_providers:
         raise ValueError(
             f"Unsupported MEM0_PROVIDER={_provider_default!r}. "
@@ -61,9 +61,10 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         )
 
     _llm_model_defaults = {
-        "anthropic": "claude-opus-4-6",
+        "anthropic": "claude-sonnet-4-6",
         "ollama": "qwen3:14b",
         "openai": "gpt-5.4-nano",
+        "claude_cli": "claude-sonnet-4-6",
     }
     llm_model = env("MEM0_LLM_MODEL", _llm_model_defaults[llm_provider])
     llm_max_tokens = int(env("MEM0_LLM_MAX_TOKENS", "16384"))
@@ -85,6 +86,15 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         openai_key = opt_env("OPENAI_API_KEY")
         if openai_key:
             llm_config["api_key"] = openai_key
+    elif llm_provider == "claude_cli":
+        # Subprocess-invoked Claude CLI; auth via Claude Code OAT (no api_key).
+        # Optional knobs: MEM0_CLAUDE_CLI_PATH (binary), MEM0_CLAUDE_CLI_TIMEOUT.
+        cli_path = opt_env("MEM0_CLAUDE_CLI_PATH")
+        if cli_path:
+            llm_config["cli_path"] = cli_path
+        cli_timeout = opt_env("MEM0_CLAUDE_CLI_TIMEOUT")
+        if cli_timeout:
+            llm_config["timeout_seconds"] = int(cli_timeout)
 
     # --- Embedder ---
     embed_provider = env("MEM0_EMBED_PROVIDER", "ollama")
@@ -153,7 +163,9 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
 
     # --- Graph Store (conditional) ---
     enable_graph = bool_env("MEM0_ENABLE_GRAPH")
-    graph_llm_provider_raw: str | None = None  # set inside block, used for provider registration
+    graph_llm_provider_raw: str | None = (
+        None  # set inside block, used for provider registration
+    )
     if enable_graph:
         neo4j_url = env("MEM0_NEO4J_URL", "bolt://127.0.0.1:7687")
         neo4j_user = env("MEM0_NEO4J_USER", "neo4j")
@@ -181,6 +193,7 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
             graph_neo4j_config["base_label"] = neo4j_base_label
 
         # Graph LLM — MUST be explicit (mem0ai defaults to "openai" if omitted)
+        # claude_cli is supported via the tool-calling shim (see llm_claude_cli.py).
         graph_llm_provider_raw = env("MEM0_GRAPH_LLM_PROVIDER", _provider_default)
         graph_llm_provider = graph_llm_provider_raw
         graph_llm_model = env("MEM0_GRAPH_LLM_MODEL", llm_model)
@@ -193,6 +206,14 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
             graph_llm_config["ollama_base_url"] = _resolve_ollama_url(
                 "MEM0_GRAPH_LLM_URL", "MEM0_LLM_URL"
             )
+        elif graph_llm_provider == "claude_cli":
+            # Tool-calling is simulated via --json-schema; see llm_claude_cli.py.
+            cli_path = opt_env("MEM0_CLAUDE_CLI_PATH")
+            if cli_path:
+                graph_llm_config["cli_path"] = cli_path
+            cli_timeout = opt_env("MEM0_CLAUDE_CLI_TIMEOUT")
+            if cli_timeout:
+                graph_llm_config["timeout_seconds"] = int(cli_timeout)
         elif graph_llm_provider in ("anthropic", "anthropic_oat"):
             if token:
                 graph_llm_config["api_key"] = token
@@ -250,20 +271,39 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         },
     ]
     # Register Anthropic when used as main LLM, graph LLM, or contradiction LLM
-    contradiction_provider = env(
-        "MEM0_GRAPH_CONTRADICTION_LLM_PROVIDER", "anthropic"
-    )
+    contradiction_provider = env("MEM0_GRAPH_CONTRADICTION_LLM_PROVIDER", "anthropic")
     _needs_anthropic = (
         llm_provider == "anthropic"
         or (enable_graph and graph_llm_provider_raw in ("anthropic", "anthropic_oat"))
-        or (enable_graph and graph_llm_provider_raw == "gemini_split"
-            and contradiction_provider in ("anthropic", "anthropic_oat"))
+        or (
+            enable_graph
+            and graph_llm_provider_raw == "gemini_split"
+            and contradiction_provider in ("anthropic", "anthropic_oat")
+        )
     )
     if _needs_anthropic:
-        providers_info.append({
-            "name": "anthropic",
-            "class_path": "mem0_mcp_selfhosted.llm_anthropic.AnthropicOATLLM",
-        })
+        providers_info.append(
+            {
+                "name": "anthropic",
+                "class_path": "mem0_mcp_selfhosted.llm_anthropic.AnthropicOATLLM",
+            }
+        )
+    _needs_claude_cli = (
+        llm_provider == "claude_cli"
+        or (enable_graph and graph_llm_provider_raw == "claude_cli")
+        or (
+            enable_graph
+            and graph_llm_provider_raw == "gemini_split"
+            and contradiction_provider == "claude_cli"
+        )
+    )
+    if _needs_claude_cli:
+        providers_info.append(
+            {
+                "name": "claude_cli",
+                "class_path": "mem0_mcp_selfhosted.llm_claude_cli.ClaudeCliLLM",
+            }
+        )
 
     # Split-model config: if gemini_split was requested, provide the config
     # for server.py to swap the graph LLM after Memory creation.
@@ -277,8 +317,9 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         # Provider-aware default: when contradiction provider is anthropic,
         # default to a Claude model (not the main LLM model which may be Ollama).
         _contradiction_model_defaults = {
-            "anthropic": "claude-opus-4-6",
-            "anthropic_oat": "claude-opus-4-6",
+            "anthropic": "claude-sonnet-4-6",
+            "anthropic_oat": "claude-sonnet-4-6",
+            "claude_cli": "claude-sonnet-4-6",
         }
         contradiction_model = env(
             "MEM0_GRAPH_CONTRADICTION_LLM_MODEL",

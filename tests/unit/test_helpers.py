@@ -121,18 +121,33 @@ class TestCallWithGraph:
             call_with_graph(None, False, False, lambda: "ok")
 
 
+def _stub_scroll(memory, pages):
+    """Configure memory.vector_store.client.scroll to yield the given pages.
+
+    `pages` is a list of point lists; each call returns the next page paired
+    with a non-None offset, except the last which pairs with None to terminate
+    the loop in _scroll_all_points.
+    """
+    returns = []
+    for idx, page in enumerate(pages):
+        next_offset = f"cursor-{idx}" if idx < len(pages) - 1 else None
+        returns.append((page, next_offset))
+    if not returns:
+        returns = [([], None)]
+    memory.vector_store.client.scroll.side_effect = returns
+
+
 class TestSafeBulkDelete:
     def test_iterates_and_deletes(self):
         memory = MagicMock()
         memory.enable_graph = False
         memory.graph = None
 
-        # Mock vector_store.list returning items with .id
         item1 = MagicMock()
         item1.id = "id-1"
         item2 = MagicMock()
         item2.id = "id-2"
-        memory.vector_store.list.return_value = [item1, item2]
+        _stub_scroll(memory, [[item1, item2]])
 
         count = safe_bulk_delete(memory, {"user_id": "testuser"})
 
@@ -141,10 +156,26 @@ class TestSafeBulkDelete:
         memory.delete.assert_any_call("id-1")
         memory.delete.assert_any_call("id-2")
 
+    def test_paginates_until_cursor_exhausted(self):
+        """Multi-page scroll: every page's points must be deleted, not just the first."""
+        memory = MagicMock()
+        memory.enable_graph = False
+        memory.graph = None
+
+        page1 = [MagicMock(id=f"id-{i}") for i in range(3)]
+        page2 = [MagicMock(id=f"id-{i}") for i in range(3, 5)]
+        _stub_scroll(memory, [page1, page2])
+
+        count = safe_bulk_delete(memory, {"user_id": "u"})
+
+        assert count == 5
+        assert memory.delete.call_count == 5
+        assert memory.vector_store.client.scroll.call_count == 2
+
     def test_graph_cleanup_when_graph_enabled_true(self):
         memory = MagicMock()
         memory.graph = MagicMock()
-        memory.vector_store.list.return_value = []
+        _stub_scroll(memory, [])
 
         safe_bulk_delete(memory, {"user_id": "testuser"}, graph_enabled=True)
 
@@ -153,7 +184,7 @@ class TestSafeBulkDelete:
     def test_no_graph_cleanup_when_graph_enabled_false(self):
         memory = MagicMock()
         memory.graph = MagicMock()
-        memory.vector_store.list.return_value = []
+        _stub_scroll(memory, [])
 
         safe_bulk_delete(memory, {"user_id": "testuser"}, graph_enabled=False)
 
@@ -163,11 +194,56 @@ class TestSafeBulkDelete:
         """Default graph_enabled=False skips graph cleanup."""
         memory = MagicMock()
         memory.graph = MagicMock()
-        memory.vector_store.list.return_value = []
+        _stub_scroll(memory, [])
 
         safe_bulk_delete(memory, {"user_id": "testuser"})
 
         memory.graph.delete_all.assert_not_called()
+
+    def test_sweeps_batch_uuids_before_delete_all(self):
+        """Each distinct batch_uuid in payload triggers hard_delete_batch.
+
+        Required because graph nodes can MERGE onto cross-scope existing
+        nodes (different run_id/agent_id), so graph.delete_all(filters) by
+        run_id misses them. The batch_uuid sweep cleans those up by tag.
+        """
+        memory = MagicMock()
+        memory.graph = MagicMock()
+        # Four points across two scroll pages: two share batch_uuid b1, one
+        # has b2, one has none. Splitting across pages also proves the
+        # sweep observes uuids from every page, not just the first.
+        p1 = MagicMock(id="id-1", payload={"batch_uuid": "b1", "user_id": "u"})
+        p2 = MagicMock(id="id-2", payload={"batch_uuid": "b1", "user_id": "u"})
+        p3 = MagicMock(id="id-3", payload={"batch_uuid": "b2", "user_id": "u"})
+        p4 = MagicMock(id="id-4", payload={"user_id": "u"})  # legacy, no batch_uuid
+        _stub_scroll(memory, [[p1, p2], [p3, p4]])
+        memory.graph.graph.query.return_value = [{"deleted": 0}]
+
+        safe_bulk_delete(memory, {"user_id": "u"}, graph_enabled=True)
+
+        # Each distinct batch_uuid swept exactly once. hard_delete_batch
+        # issues 2 queries (relations + nodes) per call, so 2 distinct
+        # batch_uuids → 4 queries.
+        assert memory.graph.graph.query.call_count == 4
+        observed_batch_uuids = {
+            call.kwargs["params"]["batch_uuid"]
+            for call in memory.graph.graph.query.call_args_list
+        }
+        assert observed_batch_uuids == {"b1", "b2"}
+        # Filter-based fallback still runs.
+        memory.graph.delete_all.assert_called_once_with({"user_id": "u"})
+
+    def test_sweep_failure_does_not_block_filter_fallback(self):
+        """An exception from hard_delete_batch must not skip graph.delete_all."""
+        memory = MagicMock()
+        memory.graph = MagicMock()
+        p1 = MagicMock(id="id-1", payload={"batch_uuid": "b1", "user_id": "u"})
+        _stub_scroll(memory, [[p1]])
+        memory.graph.graph.query.side_effect = RuntimeError("neo4j hiccup")
+
+        safe_bulk_delete(memory, {"user_id": "u"}, graph_enabled=True)
+
+        memory.graph.delete_all.assert_called_once_with({"user_id": "u"})
 
 
 class TestGcOrphanGraphNodes:
@@ -573,8 +649,6 @@ class TestTagBatchProvenance:
             batch_uuid="b1",
             start_ts=1000,
             user_id="u",
-            agent_id=None,
-            run_id=None,
             added_entities=[[{"source": "x", "relationship": "R", "target": "y"}]],
         )
         assert (rel, node) == (0, 0)
@@ -587,8 +661,6 @@ class TestTagBatchProvenance:
             batch_uuid="b1",
             start_ts=1000,
             user_id="u",
-            agent_id=None,
-            run_id=None,
             added_entities=[],
         )
         assert (rel, node) == (0, 0)
@@ -606,25 +678,45 @@ class TestTagBatchProvenance:
             batch_uuid="b1",
             start_ts=1000,
             user_id="u",
-            agent_id="a",
-            run_id="r",
             added_entities=[[{"source": "x", "relationship": "R", "target": "y"}]],
         )
         assert rel == 2
         assert node == 3
         assert memory.graph.graph.query.call_count == 2
 
-        # Pass A params include scope, triples, batch_uuid, start_ts.
+        # Pass A params: triples + user_id + batch_uuid + start_ts. No
+        # agent_id / run_id (deliberately dropped — see helpers.py docstring).
         pass_a_call = memory.graph.graph.query.call_args_list[0]
         params = pass_a_call.kwargs["params"]
-        assert params["uid"] == "u"
-        assert params["agent_id"] == "a"
-        assert params["run_id"] == "r"
-        assert params["batch_uuid"] == "b1"
-        assert params["start_ts"] == 1000
-        assert params["triples"] == [
-            {"source": "x", "relationship": "R", "target": "y"}
+        assert params == {
+            "triples": [{"source": "x", "relationship": "R", "target": "y"}],
+            "uid": "u",
+            "start_ts": 1000,
+            "batch_uuid": "b1",
+        }
+
+    def test_pass_a_cypher_does_not_filter_by_run_id_or_agent_id(self):
+        """Regression: cross-scope MERGE'd nodes (existing nodes whose run_id
+        was set by an earlier add) must still be tagged. Filtering Pass A by
+        s.run_id silently misses every relation between such nodes.
+        """
+        memory = MagicMock()
+        memory.graph.graph.query.side_effect = [
+            [{"tagged": 1}],
+            [{"tagged": 1}],
         ]
+        tag_batch_provenance(
+            memory,
+            batch_uuid="b1",
+            start_ts=1000,
+            user_id="u",
+            added_entities=[[{"source": "x", "relationship": "R", "target": "y"}]],
+        )
+        pass_a_cypher = memory.graph.graph.query.call_args_list[0][0][0]
+        assert "$run_id" not in pass_a_cypher
+        assert "$agent_id" not in pass_a_cypher
+        assert "s.run_id" not in pass_a_cypher
+        assert "s.agent_id" not in pass_a_cypher
 
     def test_skips_pass_b_when_pass_a_tags_zero(self):
         """If Pass A doesn't match any relations (e.g. sanitizer drift),
@@ -636,8 +728,6 @@ class TestTagBatchProvenance:
             batch_uuid="b1",
             start_ts=1000,
             user_id="u",
-            agent_id=None,
-            run_id=None,
             added_entities=[[{"source": "x", "relationship": "R", "target": "y"}]],
         )
         assert (rel, node) == (0, 0)
@@ -858,7 +948,9 @@ class TestDeleteMemoryWithBatch:
         """Build a Memory mock for delete tests."""
         memory = MagicMock()
         memory.graph = MagicMock() if graph else None
-        memory.vector_store.get.return_value.payload = payload if payload is not None else {}
+        memory.vector_store.get.return_value.payload = (
+            payload if payload is not None else {}
+        )
         memory.vector_store.list.return_value = (
             [MagicMock() for _ in range(anchors)],
             None,
@@ -937,9 +1029,7 @@ class TestDeleteMemoryWithBatch:
     def test_qdrant_scroll_failure_leaves_graph_intact(self):
         """If the anchor count fails (Qdrant down mid-flow), we never
         hard-delete on partial state — the tagged graph stays as-is."""
-        memory = self._make_memory(
-            payload={"user_id": "alice", "batch_uuid": "b1"}
-        )
+        memory = self._make_memory(payload={"user_id": "alice", "batch_uuid": "b1"})
         memory.vector_store.list.side_effect = RuntimeError("Qdrant down")
 
         from mem0_mcp_selfhosted.helpers import delete_memory_with_batch

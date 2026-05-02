@@ -405,6 +405,96 @@ def patch_fact_retrieval_prompt() -> None:
     )
 
 
+# Provider names that mem0ai's LlmConfig validator rejects out-of-the-box but
+# which we register with LlmFactory. Extending the validator allow-list lets
+# them through MemoryConfig parsing so the factory registration can take effect.
+_EXTRA_LLM_PROVIDERS = ("claude_cli", "anthropic_oat")
+
+
+def patch_llm_config_validator() -> None:
+    """Extend mem0ai's LlmConfig provider allow-list with our custom providers.
+
+    mem0ai's ``LlmConfig.validate_config`` (mem0/llms/configs.py) is a Pydantic
+    field validator with a hardcoded provider tuple. ``LlmFactory.register_provider``
+    only updates the factory map — it does NOT teach the validator about new
+    names, so a config with ``provider="claude_cli"`` is rejected during
+    ``MemoryConfig(**dict)`` parsing, before the factory is ever consulted.
+
+    This patch swaps the validator function with one that also accepts the
+    providers in ``_EXTRA_LLM_PROVIDERS``. Negative cases (truly unknown
+    providers) remain rejected.
+
+    Opt-out via ``MEM0_LLM_VALIDATOR_PATCH=false``. Idempotent. Must be called
+    BEFORE ``Memory.from_config()``.
+    """
+    if env("MEM0_LLM_VALIDATOR_PATCH", "true").lower() in ("false", "0", "no"):
+        logger.info(
+            "MEM0_LLM_VALIDATOR_PATCH=false — skipping LlmConfig allow-list patch"
+        )
+        return
+
+    from mem0.configs.base import MemoryConfig
+    from mem0.llms.configs import LlmConfig
+
+    # Snapshot the original allow-list by probing — it lives inside the original
+    # function body as a literal tuple, but we can recover it by trying each
+    # candidate against the original validator. Cheaper to just hardcode the
+    # built-in set; mem0ai's list is stable across patch versions.
+    builtin = {
+        "openai",
+        "ollama",
+        "anthropic",
+        "groq",
+        "together",
+        "aws_bedrock",
+        "litellm",
+        "azure_openai",
+        "openai_structured",
+        "azure_openai_structured",
+        "gemini",
+        "deepseek",
+        "minimax",
+        "xai",
+        "sarvam",
+        "lmstudio",
+        "vllm",
+        "langchain",
+    }
+    allow = builtin | set(_EXTRA_LLM_PROVIDERS)
+
+    def _validate(v, info):
+        provider = info.data.get("provider")
+        if provider in allow:
+            return v
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+
+    # Pydantic v2 reads the validator as a bound descriptor — assign on class
+    # so info.func is a bound method with (v, info) signature, matching the
+    # original (cls already bound).
+    LlmConfig.validate_config = _validate
+    decorator = LlmConfig.__pydantic_decorators__.field_validators["validate_config"]
+    decorator.func = LlmConfig.validate_config
+
+    # model_rebuild(force=True) recompiles the schema with the new validator;
+    # nested users (GraphStoreConfig, MemoryConfig) need rebuilding too so
+    # their compiled validators pick up the swapped LlmConfig. Order matters:
+    # bottom-up — innermost first so outer rebuilds capture the refreshed inner
+    # schema. MemoryConfig last because it contains GraphStoreConfig.
+    LlmConfig.model_rebuild(force=True)
+    try:
+        from mem0.graphs.configs import GraphStoreConfig
+
+        GraphStoreConfig.model_rebuild(force=True)
+    except ImportError:
+        pass
+    MemoryConfig.model_rebuild(force=True)
+
+    logger.info(
+        "Patched mem0ai LlmConfig allow-list with: %s",
+        ", ".join(sorted(_EXTRA_LLM_PROVIDERS)),
+    )
+
+
 def patch_gemini_parse_response() -> None:
     """Monkey-patch mem0ai's GeminiLLM to guard against null content responses.
 
@@ -598,13 +688,54 @@ def gc_orphan_graph_nodes(
         return 0
 
 
+def _scroll_all_points(
+    memory: Any, filters: dict[str, Any] | None, *, page_size: int = 500
+) -> list[Any]:
+    """Page through every Qdrant point matching filters using scroll cursors.
+
+    mem0ai's vector_store.list() exposes only one scroll page (default
+    limit=100) and discards next_page_offset, so callers that need the full
+    set must drive the scroll themselves via the underlying client.
+    """
+    client = memory.vector_store.client
+    collection = memory.vector_store.collection_name
+    scroll_filter = memory.vector_store._create_filter(filters) if filters else None
+    points: list[Any] = []
+    offset: Any = None
+    while True:
+        records, next_offset = client.scroll(
+            collection_name=collection,
+            scroll_filter=scroll_filter,
+            limit=page_size,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        points.extend(records or [])
+        if not next_offset:
+            return points
+        offset = next_offset
+
+
 def safe_bulk_delete(
     memory: Any, filters: dict[str, Any], *, graph_enabled: bool = False
 ) -> int:
     """Safely delete all memories matching filters.
 
     NEVER calls memory.delete_all() (which triggers vector_store.reset()).
-    Instead: iterate + individual delete + mandatory graph cleanup.
+    Instead: collect batch_uuids → iterate + individual delete →
+    sweep batch_uuids → graph.delete_all fallback.
+
+    Why the batch_uuid sweep: a per-memory delete only fires
+    hard_delete_batch when the LAST anchor for that batch_uuid is gone
+    (see delete_memory_with_batch). For a bulk cleanup the order in which
+    we delete anchors can leave intermediate state where some batches still
+    have other anchors waiting their turn — and if any anchor delete fails,
+    the batch's hard-delete never fires. Worse, a batch's nodes can be
+    MERGE'd onto pre-existing cross-scope nodes whose run_id/agent_id no
+    longer matches the bulk filter, so graph.delete_all(filters) misses
+    them. Sweeping every distinct batch_uuid we observed in scope cleans
+    those leaks deterministically.
 
     Args:
         graph_enabled: Explicit graph state from caller (avoids reading
@@ -612,10 +743,23 @@ def safe_bulk_delete(
 
     Returns the count of deleted memories.
     """
-    # Get all memories matching the filters
-    # Qdrant.list() returns raw scroll result: (records, next_page_offset)
-    result = memory.vector_store.list(filters=filters)
-    memories = result[0] if isinstance(result, tuple) else result
+    # Page through every memory in scope. mem0ai's vector_store.list() caps at
+    # one scroll page (default 100); a partial result here would silently leave
+    # records behind and skip their batch_uuids.
+    memories = _scroll_all_points(memory, filters)
+
+    # Snapshot every distinct batch_uuid in scope BEFORE deleting. After deletes,
+    # the vector payloads are gone and we'd lose the ability to reclaim graph
+    # elements that MERGE'd onto cross-scope nodes.
+    batch_uuids: set[str] = set()
+    for item in memories or []:
+        payload = getattr(item, "payload", None) or (
+            item if isinstance(item, dict) else {}
+        )
+        if isinstance(payload, dict):
+            b = payload.get("batch_uuid")
+            if isinstance(b, str) and b:
+                batch_uuids.add(b)
 
     count = 0
     for item in memories:
@@ -633,8 +777,18 @@ def safe_bulk_delete(
         except Exception as exc:
             logger.warning("Failed to delete memory %s: %s", memory_id, exc)
 
-    # Mandatory graph cleanup — memory.delete() does NOT clean Neo4j (GitHub #3245)
+    # Mandatory graph cleanup — memory.delete() does NOT clean Neo4j (GitHub #3245).
+    # Two-step cleanup: hard_delete_batch sweeps tagged elements (catches
+    # cross-scope MERGE'd nodes); graph.delete_all(filters) sweeps anything
+    # un-tagged that still matches the explicit filter.
     if graph_enabled and hasattr(memory, "graph") and memory.graph is not None:
+        for batch_uuid in batch_uuids:
+            try:
+                hard_delete_batch(memory, batch_uuid)
+            except Exception as exc:
+                logger.warning(
+                    "Bulk hard_delete_batch failed for %s: %s", batch_uuid, exc
+                )
         try:
             memory.graph.delete_all(filters)
         except Exception as exc:
@@ -685,10 +839,9 @@ def _list_entities_scroll_fallback(memory: Any) -> dict[str, list[dict]]:
         "run_id": {},
     }
 
-    # Scroll through all memories in batches
-    # Qdrant.list() returns raw scroll result: (records, next_page_offset)
-    result = memory.vector_store.list(filters={}, limit=500)
-    all_memories = result[0] if isinstance(result, tuple) else result
+    # Scroll every memory in the collection. A single page would silently miss
+    # users/agents/runs whose only memories live past the first scroll batch.
+    all_memories = _scroll_all_points(memory, filters=None)
     for item in all_memories:
         payload = item.payload if hasattr(item, "payload") else item
         if isinstance(payload, dict):
@@ -731,17 +884,24 @@ def _list_entities_scroll_fallback(memory: Any) -> dict[str, list[dict]]:
 # ---------------------------------------------------------------------------
 
 
-# Pass A: tag relations matched by triple identity AND timestamp window AND
-# scope. Triple identity comes from mem.add()'s returned added_entities, so
-# the timestamp window only has to filter same-millisecond collisions on
-# matching triples — not all activity in scope.
+# Pass A: tag relations matched by triple identity + timestamp window, scoped
+# only by the caller's user_id. Triple identity comes from mem.add()'s returned
+# added_entities; the timestamp window filters same-millisecond collisions on
+# matching triples; user_id provides multi-tenant isolation.
+#
+# We deliberately do NOT filter by run_id or agent_id on the endpoint nodes:
+# mem0ai's `_add_entities` MERGE keys nodes on (name, user_id) only, so an add
+# under run_id=X often re-uses pre-existing nodes whose run_id is from a
+# DIFFERENT prior add. Filtering Pass A on s.run_id would then silently miss
+# all relations created in this call between cross-scope MERGE'd nodes,
+# leaving the batch un-tagged. Concurrent same-user adds can't collide
+# because add_with_batch_provenance holds _graph_lock for the full duration
+# of mem.add() + Pass A — within the timestamp window only one add executed.
 _PASS_A_TAG_RELATIONS_CYPHER = """
 UNWIND $triples AS t
 MATCH (s {user_id: $uid, name: t.source})-[r]->(d {user_id: $uid, name: t.target})
 WHERE type(r) = t.relationship
   AND ((r.created_at >= $start_ts) OR (r.updated_at >= $start_ts))
-  AND ($agent_id IS NULL OR (s.agent_id = $agent_id AND d.agent_id = $agent_id))
-  AND ($run_id   IS NULL OR (s.run_id   = $run_id   AND d.run_id   = $run_id))
 SET r.batch_uuids = CASE
     WHEN $batch_uuid IN coalesce(r.batch_uuids, [])
     THEN r.batch_uuids
@@ -840,14 +1000,16 @@ def tag_batch_provenance(
     batch_uuid: str,
     start_ts: int,
     user_id: str,
-    agent_id: str | None,
-    run_id: str | None,
     added_entities: Any,
 ) -> tuple[int, int]:
     """Run Pass A (relations) + Pass B (endpoint backfill).
 
     Returns (relations_tagged, nodes_tagged). Returns (0, 0) and skips Cypher
     entirely when there's nothing to tag (no graph, no extracted relations).
+
+    Scope: user_id only. agent_id/run_id are deliberately omitted from the
+    Pass A filter — see _PASS_A_TAG_RELATIONS_CYPHER docstring for the full
+    rationale.
     """
     if memory.graph is None:
         return (0, 0)
@@ -859,8 +1021,6 @@ def tag_batch_provenance(
     pass_a_params: dict[str, Any] = {
         "triples": triples,
         "uid": user_id,
-        "agent_id": agent_id,
-        "run_id": run_id,
         "start_ts": start_ts,
         "batch_uuid": batch_uuid,
     }
@@ -1022,8 +1182,6 @@ def add_with_batch_provenance(
                 batch_uuid=batch_uuid,
                 start_ts=start_ts,
                 user_id=user_id,
-                agent_id=agent_id,
-                run_id=run_id,
                 added_entities=added,
             )
 
